@@ -10,7 +10,7 @@
 Accelerates prefill by splitting long sequences into sub-sequences
 and processing them in parallel across SMs.
 
-Only active under torch.inference_mode() with varlen (cu_seqlens != None).
+Only active for variable-length inputs without static graph offsets.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ if USE_TF32X3_AFFINE_CHAIN and not IS_TF32_SUPPORTED:
 
 
 class IntraCardCPBackend(BaseBackend):
-    """Intra-card context parallel backend for chunk_gated_delta_rule_fwd_h."""
+    """Intra-card context parallel backend for shared delta-rule state scans."""
 
     backend_type = "intracard_cp"
     package_name = None  # No external package needed
@@ -64,15 +64,15 @@ class IntraCardCPBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_cpu: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
+        chunk_offsets: torch.LongTensor | None = None,
     ) -> tuple[bool, str | None]:
         """Check if intracard CP should handle this call."""
-        # Only in inference mode
-        if not torch.is_inference_mode_enabled():
-            return False, "Not in inference mode"
-
-        # Only for varlen
         if cu_seqlens is None:
             return False, "cu_seqlens is None"
+        if chunk_offsets is not None:
+            return False, "static chunk_offsets are not supported"
+        if k.shape[-1] > 256:
+            return False, "key head dimension exceeds 256"
 
         return True, None
 
@@ -91,6 +91,7 @@ class IntraCardCPBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_cpu: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
+        chunk_offsets: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Intra-card CP implementation of chunk_gated_delta_rule_fwd_h."""
         from fla.ops.common.intracard_cp import intracard_fwd_h
@@ -106,5 +107,82 @@ class IntraCardCPBackend(BaseBackend):
             chunk_indices=chunk_indices,
             max_splits=MAX_SUBSEQS,
             state_v_first=state_v_first,
+            use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+        )
+
+    def chunk_gated_delta_rule_bwd_dhu_verifier(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        h0: torch.Tensor | None = None,
+        dht: torch.Tensor | None = None,
+        scale: float | None = None,
+        state_v_first: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        chunk_size: int = 64,
+        chunk_indices: torch.LongTensor | None = None,
+        chunk_offsets: torch.LongTensor | None = None,
+        use_graph: bool = False,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+    ) -> tuple[bool, str | None]:
+        if cu_seqlens is None:
+            return False, "cu_seqlens is None"
+        if chunk_offsets is not None:
+            return False, "static chunk_offsets are not supported"
+        if use_graph:
+            return False, "use_graph=True is not supported"
+        if scale is None:
+            return False, "scale is None"
+        if g is not None and gk is not None:
+            return False, "simultaneous scalar and per-key gates are not supported"
+        if q.shape[-1] > 256:
+            return False, "key head dimension exceeds 256"
+        return True, None
+
+    def chunk_gated_delta_rule_bwd_dhu(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        h0: torch.Tensor | None = None,
+        dht: torch.Tensor | None = None,
+        scale: float | None = None,
+        state_v_first: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        chunk_size: int = 64,
+        chunk_indices: torch.LongTensor | None = None,
+        chunk_offsets: torch.LongTensor | None = None,
+        use_graph: bool = False,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        from fla.ops.common.intracard_cp import intracard_bwd_dhu
+
+        return intracard_bwd_dhu(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=gk,
+            h0=h0,
+            dht=dht,
+            scale=scale,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            max_splits=MAX_SUBSEQS,
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
         )

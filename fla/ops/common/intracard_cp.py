@@ -5,7 +5,7 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""Intra-Card Context Parallel for KDA inference (varlen mode only).
+"""Intra-card context parallelism for shared delta-rule state scans.
 
 Optimized: all CPU-side index computation uses pure Python loops instead of
 torch tensor operations (repeat_interleave, arange, cumsum, etc.) to eliminate
@@ -23,22 +23,25 @@ from typing import NamedTuple
 import torch
 import triton
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
-from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
+from fla.ops.common.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+)
+from fla.ops.cp.chunk_delta_h import pre_process_bwd_kernel_merged, pre_process_fwd_kernel_merged
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
 from fla.utils import IS_TF32_SUPPORTED, get_multiprocessor_count
 
 logger = logging.getLogger(__name__)
 
 
-# Cache for intracard_fwd_h precomputation (Python results + GPU tensors)
+# Cache for intra-card state-scan precomputation (Python results + GPU tensors)
 # Key: object id of cu_seqlens (consistent with tensor_cache philosophy)
 _intracard_cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
 _INTRACARD_CACHE_MAXSIZE = 32
 
 
 class _CacheEntry(NamedTuple):
-    """Cache entry for intracard_fwd_h precomputation.
+    """Cache entry for intra-card state-scan precomputation.
 
     Caches both Python computation results and GPU tensors to eliminate
     redundant CPU→GPU transfers and Python loop computation.
@@ -54,6 +57,7 @@ class _CacheEntry(NamedTuple):
     cu_seqlens_split_values: list[int]
     S_split_total: int
     non_first_indices: list[int]
+    non_last_indices: list[int]
     first_subseq_indices: list[int]
     last_subseq_indices: list[int]
     num_non_first: int
@@ -134,6 +138,71 @@ def _raw_chunk_gated_delta_rule_fwd_h(
         STATE_V_FIRST=state_v_first,
     )
     return h, v_new, final_state
+
+
+def _raw_chunk_gated_delta_rule_bwd_dhu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    h0: torch.Tensor | None = None,
+    dht: torch.Tensor | None = None,
+    scale: float | None = None,
+    state_v_first: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+    chunk_offsets: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
+    BT = chunk_size
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    if cu_seqlens is None:
+        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+    else:
+        N, NT = len(cu_seqlens) - 1, len(chunk_indices)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
+
+    if state_v_first:
+        dh = q.new_empty(B, NT, HV, V, K)
+    else:
+        dh = q.new_empty(B, NT, HV, K, V)
+    dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
+    dv2 = torch.empty_like(dv)
+
+    def grid(meta):
+        return (triton.cdiv(V, meta['BV']) * N * HV, )
+
+    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
+        q=q,
+        k=k,
+        w=w,
+        g=g,
+        gk=gk,
+        dht=dht,
+        dh0=dh0,
+        do=do,
+        dh=dh,
+        dv=dv,
+        dv2=dv2,
+        cu_seqlens=cu_seqlens,
+        chunk_offsets=chunk_offsets,
+        scale=scale,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BT=BT,
+        STATE_V_FIRST=state_v_first,
+    )
+    return dh, dh0, dv2
 
 
 def compute_subseq_len(
@@ -296,6 +365,55 @@ def intracard_pre_scan(
     return hm
 
 
+def intracard_pre_scan_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor | None,
+    gk: torch.Tensor | None,
+    scale: float,
+    cu_seqlens_subseq_split: torch.Tensor,
+    S_split: int,
+    chunk_size: int = 64,
+    use_tf32x3_affine_chain: bool = False,
+) -> torch.Tensor:
+    H, K, V, HV = q.shape[2], q.shape[3], do.shape[3], do.shape[2]
+    BK = triton.next_power_of_2(K)
+    BLOCK_SIZE = 32 if K <= 64 else 64
+    dhm = q.new_empty(S_split, HV, K, V + K, dtype=torch.float32)
+
+    grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV, S_split)
+    pre_process_bwd_kernel_merged[grid](
+        q=q,
+        k=k,
+        w=w,
+        g=g,
+        gk=gk,
+        do=do,
+        dhm=dhm,
+        dv=dv,
+        cu_seqlens=cu_seqlens_subseq_split,
+        scale=scale,
+        T=0,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BT=chunk_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BK1=BK,
+        USE_BG=False,
+        MULTI_SEQS=True,
+        AFFINE_CHAIN_PRECISION=(
+            "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
+            else ("ieee" if not IS_TF32_SUPPORTED else None)
+        ),
+    )
+    return dhm
+
+
 def intracard_merge(
     hm: torch.Tensor,
     split_info: SplitSeqInfo,
@@ -306,8 +424,9 @@ def intracard_merge(
     initial_state: torch.Tensor | None = None,
     state_v_first: bool = False,
     use_tf32x3_affine_chain: bool = False,
+    forward: bool = True,
 ) -> tuple[torch.Tensor | None, int]:
-    """Merge sub-sequence states using pre-computed parameters.
+    """Merge sub-sequence boundary states using pre-computed parameters.
 
     All CPU-side preparation (cumsum, offset lists) is done in the caller
     using pure Python loops. This function only creates GPU tensors and
@@ -336,15 +455,15 @@ def intracard_merge(
     h0_seq_ids = all_tensor[n_so+n_io:]
 
     if state_v_first:
-        initial_states_merge = hm.new_empty(num_non_first, HV, V, K, dtype=torch.float32)
+        boundary_states_merge = hm.new_empty(num_non_first, HV, V, K, dtype=torch.float32)
     else:
-        initial_states_merge = hm.new_empty(num_non_first, HV, K, V, dtype=torch.float32)
+        boundary_states_merge = hm.new_empty(num_non_first, HV, K, V, dtype=torch.float32)
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), num_split_seqs, HV)
 
     merge_fwd_bwd_kernel[grid](
-        h=initial_states_merge,
+        h=boundary_states_merge,
         ag_hm=hm,
         pre_or_post_num_ranks=num_split_seqs,
         rank=0,
@@ -357,7 +476,7 @@ def intracard_merge(
         K=K,
         V=V,
         BK=BK,
-        FORWARD=True,
+        FORWARD=forward,
         INTRACARD_MODE=True,
         NUM_SEQ_ENTRIES=num_split_seqs,
         STATE_V_FIRST=state_v_first,
@@ -367,20 +486,21 @@ def intracard_merge(
         ),
     )
 
-    return initial_states_merge, num_non_first
+    return boundary_states_merge, num_non_first
 
 
 def _precompute_intracard_indices(
     split_info: SplitSeqInfo,
     cu_seqlens_subseq_values: list[int],
     N_orig: int,
-) -> tuple[list[int], int, list[int], list[int], list[int], int, list[int], list[int]]:
+) -> tuple[list[int], int, list[int], list[int], list[int], list[int], int, list[int], list[int]]:
     """Pre-compute all derived indices using pure Python loops.
 
     Returns:
         cu_seqlens_split_values: flattened cu_seqlens boundaries for split seqs (for pre_scan)
         S_split_total: total number of sub-sequences from splits
         non_first_indices: indices for scattering merge results into initial_state_expanded
+        non_last_indices: indices for scattering merge results into dht_expanded
         first_subseq_indices: indices of first sub-sequence for each original sequence
         last_subseq_indices: indices of last sub-sequence for each original sequence
         num_non_first: total non-first sub-sequences (merge work)
@@ -391,11 +511,12 @@ def _precompute_intracard_indices(
     num_ss = split_info.num_subseqs
     split_ids = split_info.split_seq_ids
 
-    # cu_seqlens_split_values: for each split seq, extract [start:start+n+1] boundaries
+    # store explicit pairs because split sequences need not be adjacent in the packed input
     cu_seqlens_split_values: list[int] = []
     S_split_total = 0
     for s, n in zip(starts, num_ss):
-        cu_seqlens_split_values.extend(cu_seqlens_subseq_values[s:s+n+1])
+        for j in range(n):
+            cu_seqlens_split_values.extend((cu_seqlens_subseq_values[s + j], cu_seqlens_subseq_values[s + j + 1]))
         S_split_total += n
 
     # num_subseqs_per_seq: [N_orig], default 1 for unsplit sequences
@@ -408,6 +529,11 @@ def _precompute_intracard_indices(
     for s, n in zip(starts, num_ss):
         for j in range(1, n):
             non_first_indices.append(s + j)
+
+    non_last_indices: list[int] = []
+    for s, n in zip(starts, num_ss):
+        for j in range(n - 1):
+            non_last_indices.append(s + j)
 
     # first_subseq_indices: for scattering original initial states
     first_subseq_indices: list[int] = [0]
@@ -435,12 +561,83 @@ def _precompute_intracard_indices(
         cu_seqlens_split_values,
         S_split_total,
         non_first_indices,
+        non_last_indices,
         first_subseq_indices,
         last_subseq_indices,
         num_non_first,
         merge_seq_offsets,
         merge_init_offsets,
     )
+
+
+def _prepare_intracard_cache_entry(
+    cu_seqlens: torch.LongTensor,
+    cu_seqlens_cpu: torch.LongTensor | None,
+    num_heads: int,
+    chunk_size: int,
+    max_splits: int,
+    device: torch.device,
+) -> _CacheEntry | None:
+    if cu_seqlens_cpu is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+
+    seq_lens = torch.diff(cu_seqlens_cpu)
+    max_seq_len = int(seq_lens.max().item())
+    subseq_len = compute_subseq_len(max_seq_len, get_multiprocessor_count(), num_heads, chunk_size)
+    if (seq_lens < 2 * subseq_len).all():
+        return None
+
+    cache_key = (id(cu_seqlens), subseq_len, chunk_size, max_splits, str(device))
+    cached = _intracard_cache.get(cache_key)
+    if cached is not None:
+        if cached.cu_seqlens_ref() is cu_seqlens:
+            _intracard_cache.move_to_end(cache_key)
+            return cached
+        _intracard_cache.pop(cache_key, None)
+
+    cu_seqlens_subseq_values, split_info, total_subseqs = prepare_subseq_cu_seqlens(
+        cu_seqlens_cpu,
+        subseq_len,
+        chunk_size,
+        max_splits=max_splits,
+    )
+    if not split_info:
+        return None
+
+    (
+        cu_seqlens_split_values,
+        S_split_total,
+        non_first_indices,
+        non_last_indices,
+        first_subseq_indices,
+        last_subseq_indices,
+        num_non_first,
+        merge_seq_offsets,
+        merge_init_offsets,
+    ) = _precompute_intracard_indices(split_info, cu_seqlens_subseq_values, len(cu_seqlens_cpu) - 1)
+
+    dtype = cu_seqlens_cpu.dtype
+    cached = _CacheEntry(
+        cu_seqlens_ref=weakref.ref(cu_seqlens),
+        cu_seqlens_subseq_values=cu_seqlens_subseq_values,
+        split_info=split_info,
+        total_subseqs=total_subseqs,
+        cu_seqlens_split_values=cu_seqlens_split_values,
+        S_split_total=S_split_total,
+        non_first_indices=non_first_indices,
+        non_last_indices=non_last_indices,
+        first_subseq_indices=first_subseq_indices,
+        last_subseq_indices=last_subseq_indices,
+        num_non_first=num_non_first,
+        merge_seq_offsets=merge_seq_offsets,
+        merge_init_offsets=merge_init_offsets,
+        cu_seqlens_subseq_gpu=torch.tensor(cu_seqlens_subseq_values, dtype=dtype, device=device),
+        cu_seqlens_split_flat=torch.tensor(cu_seqlens_split_values, dtype=dtype, device=device),
+    )
+    _intracard_cache[cache_key] = cached
+    while len(_intracard_cache) > _INTRACARD_CACHE_MAXSIZE:
+        _intracard_cache.popitem(last=False)
+    return cached
 
 
 def intracard_fwd_h(
@@ -462,66 +659,20 @@ def intracard_fwd_h(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens"
 
-    _, _, _Hq, K = k.shape
+    K = k.shape[-1]
+    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
     V = u.shape[-1]
     HV = u.shape[2]
     device = k.device
-
-    if cu_seqlens_cpu is None:
-        cu_seqlens_cpu = cu_seqlens.cpu()
-
-    seq_lens = torch.diff(cu_seqlens_cpu)
-    max_seq_len = int(seq_lens.max().item())
-    num_sms = get_multiprocessor_count()
-    subseq_len = compute_subseq_len(max_seq_len, num_sms, HV, chunk_size)
-
-    early_return = (seq_lens < 2 * subseq_len).all()
-
-    cached = None
-    cache_key = None
-
-    if not early_return:
-        # Use object identity (id) for cache key, consistent with tensor_cache philosophy
-        # vLLM slice creates new Python objects per batch, so id(cu_seqlens) is safe
-        cache_key = (
-            id(cu_seqlens),  # Object identity, not content hash
-            subseq_len,
-            chunk_size,
-            max_splits,
-            str(device),
-        )
-        cached = _intracard_cache.get(cache_key)
-        if cached is not None:
-            # Guard against rare Python id reuse after original tensor is GC-ed.
-            # We only consider it a hit when the weakref points to the current object.
-            if cached.cu_seqlens_ref() is cu_seqlens:
-                _intracard_cache.move_to_end(cache_key)
-            else:
-                _intracard_cache.pop(cache_key, None)
-                cached = None
-
-        if cached is not None:
-            # Cache hit: reuse all precomputed results including GPU tensors
-            cu_seqlens_subseq_values = cached.cu_seqlens_subseq_values
-            split_info = cached.split_info
-            total_subseqs = cached.total_subseqs
-            cu_seqlens_split_values = cached.cu_seqlens_split_values
-            S_split_total = cached.S_split_total
-            non_first_indices = cached.non_first_indices
-            first_subseq_indices = cached.first_subseq_indices
-            last_subseq_indices = cached.last_subseq_indices
-            num_non_first = cached.num_non_first
-            merge_seq_offsets = cached.merge_seq_offsets
-            merge_init_offsets = cached.merge_init_offsets
-            cu_seqlens_subseq_gpu = cached.cu_seqlens_subseq_gpu
-            cu_seqlens_split_flat = cached.cu_seqlens_split_flat
-        else:
-            # Cache miss: compute Python lists
-            cu_seqlens_subseq_values, split_info, total_subseqs = prepare_subseq_cu_seqlens(
-                cu_seqlens_cpu, subseq_len, chunk_size, max_splits=max_splits
-            )
-
-    if early_return or not split_info:
+    cached = _prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        num_heads=HV,
+        chunk_size=chunk_size,
+        max_splits=max_splits,
+        device=device,
+    )
+    if cached is None:
         return _raw_chunk_gated_delta_rule_fwd_h(
             k=k,
             w=w,
@@ -537,65 +688,24 @@ def intracard_fwd_h(
             state_v_first=state_v_first,
         )
 
-    N_orig = len(cu_seqlens_cpu) - 1
-
-    if cached is None:
-        # Cache miss: continue Python computation and create GPU tensors
-        (
-            cu_seqlens_split_values,
-            S_split_total,
-            non_first_indices,
-            first_subseq_indices,
-            last_subseq_indices,
-            num_non_first,
-            merge_seq_offsets,
-            merge_init_offsets,
-        ) = _precompute_intracard_indices(split_info, cu_seqlens_subseq_values, N_orig)
-
-        # Create GPU tensors (will be cached for reuse)
-        dtype = cu_seqlens_cpu.dtype
-        cu_seqlens_subseq_gpu = torch.tensor(cu_seqlens_subseq_values, dtype=dtype, device=device)
-        cu_seqlens_split_flat = torch.tensor(cu_seqlens_split_values, dtype=dtype, device=device)
-
-        # Store all results in cache (including GPU tensors to avoid H2D)
-        _intracard_cache[cache_key] = _CacheEntry(
-            cu_seqlens_ref=weakref.ref(cu_seqlens),
-            cu_seqlens_subseq_values=cu_seqlens_subseq_values,
-            split_info=split_info,
-            total_subseqs=total_subseqs,
-            cu_seqlens_split_values=cu_seqlens_split_values,
-            S_split_total=S_split_total,
-            non_first_indices=non_first_indices,
-            first_subseq_indices=first_subseq_indices,
-            last_subseq_indices=last_subseq_indices,
-            num_non_first=num_non_first,
-            merge_seq_offsets=merge_seq_offsets,
-            merge_init_offsets=merge_init_offsets,
-            cu_seqlens_subseq_gpu=cu_seqlens_subseq_gpu,
-            cu_seqlens_split_flat=cu_seqlens_split_flat,
-        )
-        # Evict oldest entries if over capacity
-        while len(_intracard_cache) > _INTRACARD_CACHE_MAXSIZE:
-            _intracard_cache.popitem(last=False)
-
     hm = intracard_pre_scan(
         kg=k,
         w=w,
         u=u,
         g=g,
         gk=gk,
-        cu_seqlens_subseq_split=cu_seqlens_split_flat,
-        S_split=S_split_total,
+        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+        S_split=cached.S_split_total,
         chunk_size=chunk_size,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
     )
 
     initial_states_merge, num_non_first = intracard_merge(
         hm=hm,
-        split_info=split_info,
-        num_non_first=num_non_first,
-        merge_seq_offsets=merge_seq_offsets,
-        merge_init_offsets=merge_init_offsets,
+        split_info=cached.split_info,
+        num_non_first=cached.num_non_first,
+        merge_seq_offsets=cached.merge_seq_offsets,
+        merge_init_offsets=cached.merge_init_offsets,
         device=device,
         initial_state=initial_state,
         state_v_first=state_v_first,
@@ -603,17 +713,17 @@ def intracard_fwd_h(
     )
 
     if state_v_first:
-        initial_state_expanded = k.new_zeros(total_subseqs, HV, V, K, dtype=torch.float32)
+        initial_state_expanded = k.new_zeros(cached.total_subseqs, HV, V, K, dtype=torch.float32)
     else:
-        initial_state_expanded = k.new_zeros(total_subseqs, HV, K, V, dtype=torch.float32)
+        initial_state_expanded = k.new_zeros(cached.total_subseqs, HV, K, V, dtype=torch.float32)
 
     if initial_state is not None:
-        initial_state_expanded[first_subseq_indices] = initial_state
+        initial_state_expanded[cached.first_subseq_indices] = initial_state
 
     if initial_states_merge is not None and num_non_first > 0:
-        initial_state_expanded[non_first_indices] = initial_states_merge
+        initial_state_expanded[cached.non_first_indices] = initial_states_merge
 
-    chunk_indices_subseq = prepare_chunk_indices(cu_seqlens_subseq_gpu, chunk_size)
+    chunk_indices_subseq = prepare_chunk_indices(cached.cu_seqlens_subseq_gpu, chunk_size)
 
     h, v_new, final_state_subseq = _raw_chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -625,14 +735,127 @@ def intracard_fwd_h(
         output_final_state=output_final_state,
         chunk_size=chunk_size,
         save_new_value=save_new_value,
-        cu_seqlens=cu_seqlens_subseq_gpu,
+        cu_seqlens=cached.cu_seqlens_subseq_gpu,
         chunk_indices=chunk_indices_subseq,
         state_v_first=state_v_first,
     )
 
     if output_final_state and final_state_subseq is not None:
-        final_state = final_state_subseq[last_subseq_indices]
+        final_state = final_state_subseq[cached.last_subseq_indices]
     else:
         final_state = final_state_subseq
 
     return h, v_new, final_state
+
+
+def intracard_bwd_dhu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    h0: torch.Tensor | None = None,
+    dht: torch.Tensor | None = None,
+    scale: float | None = None,
+    state_v_first: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+    chunk_offsets: torch.LongTensor | None = None,
+    max_splits: int = 32,
+    use_tf32x3_affine_chain: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    assert cu_seqlens is not None, "intracard_bwd_dhu requires cu_seqlens"
+    assert scale is not None, "intracard_bwd_dhu requires scale"
+
+    K = q.shape[-1]
+    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
+    V = do.shape[-1]
+    HV = do.shape[2]
+    cached = _prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        num_heads=HV,
+        chunk_size=chunk_size,
+        max_splits=max_splits,
+        device=q.device,
+    )
+    if cached is None:
+        return _raw_chunk_gated_delta_rule_bwd_dhu(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=gk,
+            h0=h0,
+            dht=dht,
+            scale=scale,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+
+    dhm = intracard_pre_scan_bwd(
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        gk=gk,
+        scale=scale,
+        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+        S_split=cached.S_split_total,
+        chunk_size=chunk_size,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+    )
+    dht_merge, num_non_first = intracard_merge(
+        hm=dhm,
+        split_info=cached.split_info,
+        num_non_first=cached.num_non_first,
+        merge_seq_offsets=cached.merge_seq_offsets,
+        merge_init_offsets=cached.merge_init_offsets,
+        device=q.device,
+        initial_state=dht,
+        state_v_first=state_v_first,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        forward=False,
+    )
+
+    if state_v_first:
+        state_shape = (cached.total_subseqs, HV, V, K)
+    else:
+        state_shape = (cached.total_subseqs, HV, K, V)
+    dht_expanded = q.new_zeros(state_shape, dtype=torch.float32)
+    if dht is not None:
+        dht_expanded[cached.last_subseq_indices] = dht
+    if dht_merge is not None and num_non_first > 0:
+        dht_expanded[cached.non_last_indices] = dht_merge
+
+    h0_expanded = q.new_empty(state_shape, dtype=torch.float32) if h0 is not None else None
+    chunk_indices_subseq = prepare_chunk_indices(cached.cu_seqlens_subseq_gpu, chunk_size)
+    dh, dh0_subseq, dv2 = _raw_chunk_gated_delta_rule_bwd_dhu(
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        gk=gk,
+        h0=h0_expanded,
+        dht=dht_expanded,
+        scale=scale,
+        state_v_first=state_v_first,
+        cu_seqlens=cached.cu_seqlens_subseq_gpu,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices_subseq,
+    )
+    dh0 = dh0_subseq[cached.first_subseq_indices] if dh0_subseq is not None else None
+    return dh, dh0, dv2

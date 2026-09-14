@@ -765,6 +765,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_indices: torch.LongTensor | None = None,
     chunk_offsets: torch.LongTensor | None = None,
     use_graph: bool = False,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
     # N: the actual number of sequences in the batch with either equal or variable lengths

@@ -41,6 +41,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
     cp_context: FLACPContext | None = None,
     chunk_indices: torch.LongTensor | None = None,
     use_gate_in_kernel: bool = False,
@@ -100,6 +101,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
         chunk_size=chunk_size,
@@ -136,6 +138,7 @@ def chunk_gated_delta_rule_bwd(
     dht: torch.Tensor,
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
     cp_context: FLACPContext | None = None,
     chunk_indices: torch.LongTensor | None = None,
     use_gate_in_kernel: bool = False,
@@ -165,6 +168,7 @@ def chunk_gated_delta_rule_bwd(
         initial_state=initial_state,
         output_final_state=False,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
         chunk_size=chunk_size,
@@ -210,6 +214,7 @@ def chunk_gated_delta_rule_bwd(
         dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
         chunk_size=chunk_size,
@@ -299,6 +304,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
             cp_context=cp_context,
             chunk_indices=chunk_indices,
             state_v_first=state_v_first,
@@ -330,6 +336,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.use_beta_sigmoid_in_kernel = use_beta_sigmoid_in_kernel
         ctx.allow_neg_eigval = allow_neg_eigval
         ctx.cp_context = cp_context
+        ctx.cu_seqlens_cpu = cu_seqlens_cpu
         ctx.state_v_first = state_v_first
         ctx.use_gate_in_kernel = use_gate_in_kernel
         return o.to(q.dtype), final_state
@@ -371,6 +378,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             do=do,
             dht=dht,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=ctx.cu_seqlens_cpu,
             cp_context=ctx.cp_context,
             chunk_indices=chunk_indices,
             state_v_first=ctx.state_v_first,

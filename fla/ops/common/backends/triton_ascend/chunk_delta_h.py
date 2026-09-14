@@ -1180,6 +1180,7 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     chunk_offsets: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
     BT = chunk_size

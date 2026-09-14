@@ -131,6 +131,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         ctx.allow_neg_eigval = allow_neg_eigval
         ctx.disable_recompute = disable_recompute
         ctx.cp_context = cp_context
+        ctx.cu_seqlens_cpu = cu_seqlens_cpu
         ctx.state_v_first = state_v_first
         return o.type_as(q), final_state
 
@@ -163,6 +164,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             g_org=g_input if ctx.use_gate_in_kernel else None,
             state_v_first=ctx.state_v_first,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=ctx.cu_seqlens_cpu,
             chunk_indices=chunk_indices,
             chunk_size=ctx.chunk_size,
             safe_gate=ctx.safe_gate,

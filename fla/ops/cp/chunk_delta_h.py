@@ -73,7 +73,12 @@ def pre_process_fwd_kernel_merged(
         i_n = 0
         hm += i_h * K * (K + V)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        if MULTI_SEQS:
+            bos = tl.load(cu_seqlens + 2 * i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + 2 * i_n + 1).to(tl.int64)
+        else:
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
         NT = tl.cdiv(T, BT)
     else:
@@ -377,24 +382,24 @@ def merge_fwd_bwd_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
     if INTRACARD_MODE:
-        i_seq = tl.program_id(1)
-        i_h = tl.program_id(2)
+        i_seq = tl.program_id(1).to(tl.int64)
+        i_h = tl.program_id(2).to(tl.int64)
 
         if i_seq >= NUM_SEQ_ENTRIES:
             return
 
         # Load offsets for this sequence
-        ss_start = tl.load(seq_offsets + i_seq).to(tl.int32)
-        ss_end = tl.load(seq_offsets + i_seq + 1).to(tl.int32)
-        init_base = tl.load(init_offsets + i_seq).to(tl.int32)
-        num_subseqs = ss_end - ss_start
+        ss_start = tl.load(seq_offsets + i_seq).to(tl.int64)
+        ss_end = tl.load(seq_offsets + i_seq + 1).to(tl.int64)
+        init_base = tl.load(init_offsets + i_seq).to(tl.int64)
+        num_subseqs = (ss_end - ss_start).to(tl.int32)
 
         stride_hm_s = HV * K * (V + K)
         stride_hm_h = K * (V + K)
 
         # Initialize from h0 if provided
         if HAS_H0:
-            orig_seq_id = tl.load(h0_seq_ids + i_seq).to(tl.int32)
+            orig_seq_id = tl.load(h0_seq_ids + i_seq).to(tl.int64)
             if STATE_V_FIRST:
                 p_h0 = h0 + (orig_seq_id * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
                 b_h = tl.load(p_h0, mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
@@ -407,9 +412,12 @@ def merge_fwd_bwd_kernel(
             else:
                 b_h = tl.zeros([BK, BV], dtype=tl.float32)
 
-        # Merge loop over subseqs
+        # the backward affine summaries already contain the transposed transition
         for idx in range(num_subseqs):
-            i_ss = ss_start + idx
+            if FORWARD:
+                i_ss = ss_start + idx
+            else:
+                i_ss = ss_end - 1 - idx
             base = i_ss * stride_hm_s + i_h * stride_hm_h
 
             # he and m are always in [K, V+K] layout from pre_scan
@@ -424,9 +432,12 @@ def merge_fwd_bwd_kernel(
                 b_h = tl.dot(b_m.to(tl.float32), b_h.to(tl.float32),
                              input_precision=AFFINE_CHAIN_PRECISION) + b_he.to(tl.float32)
 
-            # Store for non-first subseqs
+            # store the boundary state needed by the next independent subsequence
             if idx < num_subseqs - 1:
-                init_idx = init_base + idx
+                if FORWARD:
+                    init_idx = init_base + idx
+                else:
+                    init_idx = init_base + num_subseqs - 2 - idx
                 stride_init = HV * K * V
                 if STATE_V_FIRST:
                     p_out = h + init_idx * stride_init + i_h * V * K + o_v[:, None] * K + o_k[None, :]
@@ -513,6 +524,7 @@ def pre_process_bwd_kernel_merged(
     USE_GK: tl.constexpr,
     USE_BG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    MULTI_SEQS: tl.constexpr,
     AFFINE_CHAIN_PRECISION: tl.constexpr = None,
 ):
     """
@@ -523,9 +535,19 @@ def pre_process_bwd_kernel_merged(
     - Columns [V, V+K) are for computing dm (stage 2)
     """
     i_col, i_h = tl.program_id(0), tl.program_id(1)
-    i_n = 0
+    if MULTI_SEQS:
+        i_n = tl.program_id(2).to(tl.int64)
+        dhm += (i_n * HV + i_h) * K * (K + V)
+    else:
+        i_n = 0
+        dhm += i_h * K * (K + V)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        if MULTI_SEQS:
+            bos = tl.load(cu_seqlens + 2 * i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + 2 * i_n + 1).to(tl.int64)
+        else:
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
         NT = tl.cdiv(T, BT)
     else:
@@ -548,7 +570,6 @@ def pre_process_bwd_kernel_merged(
         g += (bos * HV + i_h).to(tl.int64)
     if USE_GK:
         gk += ((bos * HV + i_h) * K).to(tl.int64)
-    dhm += i_h * K * (V + K)
     stride_qk = H * K
     stride_w = H * K if USE_BG else HV * K
 
@@ -1019,6 +1040,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                     BK1=BK,
                     BLOCK_SIZE=BLOCK_SIZE,
                     USE_BG=bg is not None,
+                    MULTI_SEQS=False,
                     AFFINE_CHAIN_PRECISION=(
                         "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
                         else ("ieee" if not IS_TF32_SUPPORTED else None)
@@ -1089,6 +1111,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
             BK1=BK,
             BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=bg is not None,
+            MULTI_SEQS=False,
             AFFINE_CHAIN_PRECISION=(
                 "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
                 else ("ieee" if not IS_TF32_SUPPORTED else None)
