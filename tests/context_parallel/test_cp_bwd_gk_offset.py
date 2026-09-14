@@ -128,6 +128,7 @@ class TestBwdGkOffset:
             BK1=BK,
             BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=False,
+            MULTI_SEQS=False,
         )
 
         # Run B: head 0 = 0, heads 1+ = -10
@@ -152,6 +153,7 @@ class TestBwdGkOffset:
             BK1=BK,
             BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=False,
+            MULTI_SEQS=False,
         )
 
         # Head 0: same gk (=0) in both runs → dh must be identical

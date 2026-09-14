@@ -104,6 +104,39 @@ def test_chunk_kda_intracard_cache_hit_same_cu_seqlens_object(monkeypatch):
     assert torch.allclose(o1, o2, atol=1e-4, rtol=1e-4)
 
 
+def test_intracard_cache_miss_when_cu_seqlens_contents_change(monkeypatch):
+    chunk_size = 64
+    cu_seqlens = torch.tensor([0, 512, 640, 1152], dtype=torch.int32)
+    monkeypatch.setattr(intracard_cp_mod, "compute_subseq_len", lambda *args, **kwargs: 2 * chunk_size)
+    monkeypatch.setattr(intracard_cp_mod, "get_multiprocessor_count", lambda: 1)
+
+    first = intracard_cp_mod._prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens,
+        num_heads=1,
+        chunk_size=chunk_size,
+        max_splits=32,
+        device=cu_seqlens.device,
+    )
+    assert first is not None
+    assert first.split_info.split_seq_ids == [0, 2]
+
+    cu_seqlens.copy_(torch.tensor([0, 128, 640, 1152], dtype=cu_seqlens.dtype))
+    second = intracard_cp_mod._prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens,
+        num_heads=1,
+        chunk_size=chunk_size,
+        max_splits=32,
+        device=cu_seqlens.device,
+    )
+
+    assert second is not None
+    assert second is not first
+    assert second.split_info.split_seq_ids == [1, 2]
+    assert second.cu_seqlens_subseq_values != first.cu_seqlens_subseq_values
+
+
 def test_intracard_backend_disabled_by_default():
     """Verify that IntraCardCPBackend is disabled by default."""
     from fla.ops.common.backends.intracard import IntraCardCPBackend
@@ -362,6 +395,98 @@ def test_intracard_training_route_parity(monkeypatch, operation: str, state_v_fi
     names = ("o", "ht", "dq", "dk", "dv", "dg", "db", "dh0")
     tolerances = (0.01, 0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.01)
     for name, ref_tensor, tri_tensor, tolerance in zip(names, ref, tri, tolerances):
+        assert_close(name, ref_tensor, tri_tensor, tolerance)
+        assert torch.isfinite(tri_tensor).all()
+
+
+@pytest.mark.skipif(os.environ.get("FLA_DISABLE_BACKEND_DISPATCH") == "1", reason="backend dispatch disabled")
+@pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
+@pytest.mark.parametrize(
+    ("K", "V", "H", "HV", "gate_mode", "use_qk_l2norm_in_kernel", "disable_recompute", "cu_seqlens_values"),
+    [
+        pytest.param(128, 128, 64, 64, "precomputed", False, False, [0, 192, 576], id="pregated-mha-k128-ragged"),
+        pytest.param(256, 128, 1, 2, "precomputed", True, False, [0, 448], id="pregated-gva-k256"),
+        pytest.param(128, 96, 1, 1, "fused", True, False, [0, 384], id="fused-gate-beta"),
+        pytest.param(128, 96, 1, 1, "safe-fused", False, True, [0, 384], id="safe-fused-save-intermediates"),
+    ],
+)
+def test_intracard_kda_training_modes(
+    monkeypatch,
+    K: int,
+    V: int,
+    H: int,
+    HV: int,
+    gate_mode: str,
+    use_qk_l2norm_in_kernel: bool,
+    disable_recompute: bool,
+    cu_seqlens_values: list[int],
+):
+    torch.manual_seed(42)
+    B, T, BT = 1, cu_seqlens_values[-1], 64
+    dtype = torch.bfloat16
+    q = torch.randn(B, T, H, K, device=device, dtype=dtype)
+    k = torch.randn(B, T, H, K, device=device, dtype=dtype)
+    if not use_qk_l2norm_in_kernel:
+        q = torch.nn.functional.normalize(q.float(), dim=-1).to(dtype)
+        k = torch.nn.functional.normalize(k.float(), dim=-1).to(dtype)
+    v = torch.randn(B, T, HV, V, device=device, dtype=dtype)
+    if gate_mode == "precomputed":
+        g = -torch.rand(B, T, HV, K, device=device, dtype=torch.float32) * 0.02
+        beta = torch.randn(B, T, HV, device=device, dtype=dtype).sigmoid()
+        A_log, dt_bias = None, None
+    else:
+        g = torch.randn(B, T, HV, K, device=device, dtype=dtype) * 0.2 - 4
+        beta = torch.randn(B, T, HV, device=device, dtype=dtype)
+        A_log = torch.log(torch.empty(HV, device=device, dtype=torch.float32).uniform_(0.5, 1.5))
+        dt_bias = torch.randn(HV * K, device=device, dtype=torch.float32) * 0.1
+    do = torch.randn_like(v)
+    cu_seqlens = torch.tensor(cu_seqlens_values, device=device, dtype=torch.int32)
+    cu_seqlens_cpu = cu_seqlens.cpu()
+    monkeypatch.setattr(intracard_cp_mod, "compute_subseq_len", lambda *args, **kwargs: 2 * BT)
+    monkeypatch.setenv("FLA_FLASH_KDA", "0")
+
+    def run(enabled: bool):
+        monkeypatch.setenv("FLA_INTRACARD_CP", "1" if enabled else "0")
+        inputs = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+        q_i, k_i, v_i, g_i, beta_i = inputs
+        gate_kwargs = {}
+        if gate_mode != "precomputed":
+            A_log_i, dt_bias_i = [x.detach().clone().requires_grad_(True) for x in (A_log, dt_bias)]
+            inputs.extend((A_log_i, dt_bias_i))
+            gate_kwargs = {
+                "A_log": A_log_i,
+                "dt_bias": dt_bias_i,
+                "use_gate_in_kernel": True,
+                "use_beta_sigmoid_in_kernel": True,
+                "safe_gate": gate_mode == "safe-fused",
+                "lower_bound": -5.0 if gate_mode == "safe-fused" else None,
+            }
+        o, final_state = chunk_kda(
+            q=q_i,
+            k=k_i,
+            v=v_i,
+            g=g_i,
+            beta=beta_i,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            disable_recompute=disable_recompute,
+            chunk_size=BT,
+            **gate_kwargs,
+        )
+        assert final_state is None
+        grads = torch.autograd.grad((o * do).sum(), inputs)
+        return (o, *grads)
+
+    ref = run(False)
+    tri = run(True)
+    names = ("o", "dq", "dk", "dv", "dg", "db")
+    if gate_mode != "precomputed":
+        names += ("dA_log", "ddt_bias")
+    for name, ref_tensor, tri_tensor in zip(names, ref, tri):
+        tolerance = 0.02 if name in ("dg", "db", "dA_log", "ddt_bias") else 0.01
         assert_close(name, ref_tensor, tri_tensor, tolerance)
         assert torch.isfinite(tri_tensor).all()
 

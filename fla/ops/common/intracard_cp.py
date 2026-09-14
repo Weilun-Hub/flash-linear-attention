@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # Cache for intra-card state-scan precomputation (Python results + GPU tensors)
-# Key: object id of cu_seqlens (consistent with tensor_cache philosophy)
+# Key: object identity and contents of cu_seqlens plus split configuration
 _intracard_cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
 _INTRACARD_CACHE_MAXSIZE = 32
 
@@ -587,7 +587,8 @@ def _prepare_intracard_cache_entry(
     if (seq_lens < 2 * subseq_len).all():
         return None
 
-    cache_key = (id(cu_seqlens), subseq_len, chunk_size, max_splits, str(device))
+    cu_seqlens_fingerprint = tuple(cu_seqlens_cpu.tolist())
+    cache_key = (id(cu_seqlens), cu_seqlens_fingerprint, subseq_len, chunk_size, max_splits, str(device))
     cached = _intracard_cache.get(cache_key)
     if cached is not None:
         if cached.cu_seqlens_ref() is cu_seqlens:
