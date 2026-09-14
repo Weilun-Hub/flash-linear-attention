@@ -320,7 +320,6 @@ def test_intracard_training_route_parity(monkeypatch, operation: str, state_v_fi
     monkeypatch.setattr(intracard_cp_mod, "compute_subseq_len", lambda *args, **kwargs: 2 * BT)
     monkeypatch.setenv("FLA_FLASH_KDA", "0")
     monkeypatch.setenv("FLA_FLASH_QLA", "0")
-    monkeypatch.setenv("FLA_TILELANG", "0")
 
     def run(enabled: bool):
         monkeypatch.setenv("FLA_INTRACARD_CP", "1" if enabled else "0")
