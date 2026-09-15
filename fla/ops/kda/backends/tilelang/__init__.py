@@ -45,7 +45,10 @@ class KDATileLangBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         chunk_size: int = 64,
         chunk_indices: torch.LongTensor | None = None,
+        use_graph: bool = False,
     ) -> tuple[bool, str | None]:
+        if use_graph:
+            return False, "use_graph=True is not supported"
         if v.shape[2] != k.shape[2]:
             return False, (
                 "TileLang backend does not support GQA (v has more heads than k); "
@@ -71,7 +74,11 @@ class KDATileLangBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         chunk_size: int = 64,
         chunk_indices: torch.LongTensor | None = None,
+        use_graph: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if use_graph:
+            raise NotImplementedError("use_graph=True is not supported")
+
         from fla.ops.kda.backends.tilelang.chunk_bwd_dqkg import (
             chunk_kda_bwd_wy_dqkg_fused_tilelang,
         )

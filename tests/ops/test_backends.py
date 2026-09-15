@@ -171,3 +171,41 @@ def test_rwkv6_tilelang_backend_verifier_rejects_unsupported_dimension():
 
     assert accepted is False
     assert reason == "TileLang RWKV6 intra backend currently supports the D=64 benchmark bucket only, got K=128"
+
+
+def test_kda_tilelang_backward_use_graph_contract():
+    tensor = SimpleNamespace(shape=(1, 64, 2, 64))
+    kwargs = {
+        "q": tensor,
+        "k": tensor,
+        "v": tensor,
+        "v_new": tensor,
+        "g": tensor,
+        "beta": tensor,
+        "A": tensor,
+        "h": tensor,
+        "do": tensor,
+        "dh": tensor,
+        "dv": tensor,
+    }
+    backend = kda_tilelang_backend.KDATileLangBackend()
+
+    accepted, reason = backend.chunk_kda_bwd_wy_dqkg_fused_verifier(
+        **kwargs,
+        use_graph=False,
+    )
+    assert accepted is True
+    assert reason is None
+
+    accepted, reason = backend.chunk_kda_bwd_wy_dqkg_fused_verifier(
+        **kwargs,
+        use_graph=True,
+    )
+    assert accepted is False
+    assert reason == "use_graph=True is not supported"
+
+    with pytest.raises(NotImplementedError, match="use_graph=True is not supported"):
+        backend.chunk_kda_bwd_wy_dqkg_fused(
+            **kwargs,
+            use_graph=True,
+        )
