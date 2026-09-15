@@ -116,6 +116,7 @@ def profile_kernels(fn, rank, steps=5, warmup=2):
         with_stack=False,
         record_shapes=False,
         profile_memory=False,
+        acc_events=True,
     ) as prof:
         for _ in range(steps + 1):
             torch.cuda.synchronize()
@@ -126,10 +127,11 @@ def profile_kernels(fn, rank, steps=5, warmup=2):
     # Get kernel stats
     kernel_stats = []
     for event in prof.key_averages():
-        if event.cuda_time_total > 0:  # Only CUDA kernels
+        device_time_total = event.device_time_total
+        if device_time_total > 0:  # Only device kernels
             kernel_stats.append({
                 'name': event.key,
-                'cuda_time_ms': event.cuda_time_total / 1000,  # Convert to ms
+                'cuda_time_ms': device_time_total / 1000,  # Convert to ms
                 'calls': event.count,
             })
 
