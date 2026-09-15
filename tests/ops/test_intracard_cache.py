@@ -189,6 +189,16 @@ def test_intracard_backend_verifiers():
     assert accepted is False
     assert reason == "static chunk_offsets are not supported"
 
+    oversized = torch.empty(129)
+    accepted, reason = backend.chunk_gated_delta_rule_fwd_h_verifier(
+        k=oversized,
+        w=tensor,
+        u=tensor,
+        cu_seqlens=tensor,
+    )
+    assert accepted is False
+    assert reason == "key head dimension exceeds intra-card merge limit of 128"
+
     accepted, reason = backend.chunk_gated_delta_rule_bwd_dhu_verifier(
         q=tensor,
         k=tensor,
@@ -216,6 +226,18 @@ def test_intracard_backend_verifiers():
         accepted, reason = backend.chunk_gated_delta_rule_bwd_dhu_verifier(**common_kwargs, **call_kwargs)
         assert accepted is False
         assert reason == expected_reason
+
+    accepted, reason = backend.chunk_gated_delta_rule_bwd_dhu_verifier(
+        q=oversized,
+        k=tensor,
+        w=tensor,
+        do=tensor,
+        dv=tensor,
+        scale=1.0,
+        cu_seqlens=tensor,
+    )
+    assert accepted is False
+    assert reason == "key head dimension exceeds intra-card merge limit of 128"
 
 
 def test_intracard_split_metadata_uses_explicit_pairs():
@@ -402,22 +424,12 @@ def test_intracard_training_route_parity(monkeypatch, operation: str, state_v_fi
 @pytest.mark.skipif(os.environ.get("FLA_DISABLE_BACKEND_DISPATCH") == "1", reason="backend dispatch disabled")
 @pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
 @pytest.mark.parametrize(
-    (
-        "K",
-        "V",
-        "H",
-        "HV",
-        "BT",
-        "gate_mode",
-        "use_qk_l2norm_in_kernel",
-        "disable_recompute",
-        "cu_seqlens_values",
-    ),
+    ("K", "V", "H", "HV", "gate_mode", "use_qk_l2norm_in_kernel", "disable_recompute", "cu_seqlens_values"),
     [
-        pytest.param(128, 128, 64, 64, 64, "precomputed", False, False, [0, 192, 576], id="pregated-mha-k128-ragged"),
-        pytest.param(256, 128, 1, 2, 32, "precomputed", True, False, [0, 448], id="pregated-gva-k256-bt32"),
-        pytest.param(128, 96, 1, 1, 64, "fused", True, False, [0, 384], id="fused-gate-beta"),
-        pytest.param(128, 96, 1, 1, 64, "safe-fused", False, True, [0, 384], id="safe-fused-save-intermediates"),
+        pytest.param(128, 128, 64, 64, "precomputed", False, False, [0, 192, 576], id="pregated-mha-k128-ragged"),
+        pytest.param(128, 128, 1, 2, "precomputed", True, False, [0, 448], id="pregated-gva-k128"),
+        pytest.param(128, 96, 1, 1, "fused", True, False, [0, 384], id="fused-gate-beta"),
+        pytest.param(128, 96, 1, 1, "safe-fused", False, True, [0, 384], id="safe-fused-save-intermediates"),
     ],
 )
 def test_intracard_kda_training_modes(
@@ -426,14 +438,13 @@ def test_intracard_kda_training_modes(
     V: int,
     H: int,
     HV: int,
-    BT: int,
     gate_mode: str,
     use_qk_l2norm_in_kernel: bool,
     disable_recompute: bool,
     cu_seqlens_values: list[int],
 ):
     torch.manual_seed(42)
-    B, T = 1, cu_seqlens_values[-1]
+    B, T, BT = 1, cu_seqlens_values[-1], 64
     dtype = torch.bfloat16
     q = torch.randn(B, T, H, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)

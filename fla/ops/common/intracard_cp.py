@@ -661,7 +661,7 @@ def intracard_fwd_h(
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens"
 
     K = k.shape[-1]
-    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
+    assert K <= 128, "intra-card merge does not support key head dimensions larger than 128"
     V = u.shape[-1]
     HV = u.shape[2]
     device = k.device
@@ -773,7 +773,7 @@ def intracard_bwd_dhu(
     assert scale is not None, "intracard_bwd_dhu requires scale"
 
     K = q.shape[-1]
-    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
+    assert K <= 128, "intra-card merge does not support key head dimensions larger than 128"
     V = do.shape[-1]
     HV = do.shape[2]
     cached = _prepare_intracard_cache_entry(

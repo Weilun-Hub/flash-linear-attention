@@ -30,6 +30,9 @@ MAX_SUBSEQS = int(os.environ.get('FLA_INTRACARD_MAX_SPLITS', 32))
 # use tf32x3 for the affine-chain dots in the pre-scan/merge kernels (NVIDIA only)
 USE_TF32X3_AFFINE_CHAIN = os.environ.get('FLA_INTRACARD_TF32X3', '0') == '1'
 
+# the merge kernel materializes a full fp32 BK x BK transition matrix
+MAX_INTRACARD_HEAD_DIM = 128
+
 if USE_TF32X3_AFFINE_CHAIN and not IS_TF32_SUPPORTED:
     warnings.warn(
         "tf32x3 affine chain requires an NVIDIA GPU with compute capability >= 8.0; falling back to ieee precision",
@@ -71,8 +74,8 @@ class IntraCardCPBackend(BaseBackend):
             return False, "cu_seqlens is None"
         if chunk_offsets is not None:
             return False, "static chunk_offsets are not supported"
-        if k.shape[-1] > 256:
-            return False, "key head dimension exceeds 256"
+        if k.shape[-1] > MAX_INTRACARD_HEAD_DIM:
+            return False, f"key head dimension exceeds intra-card merge limit of {MAX_INTRACARD_HEAD_DIM}"
 
         return True, None
 
@@ -140,8 +143,8 @@ class IntraCardCPBackend(BaseBackend):
             return False, "scale is None"
         if g is not None and gk is not None:
             return False, "simultaneous scalar and per-key gates are not supported"
-        if q.shape[-1] > 256:
-            return False, "key head dimension exceeds 256"
+        if q.shape[-1] > MAX_INTRACARD_HEAD_DIM:
+            return False, f"key head dimension exceeds intra-card merge limit of {MAX_INTRACARD_HEAD_DIM}"
         return True, None
 
     def chunk_gated_delta_rule_bwd_dhu(
