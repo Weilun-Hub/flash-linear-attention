@@ -30,8 +30,7 @@ MAX_SUBSEQS = int(os.environ.get('FLA_INTRACARD_MAX_SPLITS', 32))
 # use tf32x3 for the affine-chain dots in the pre-scan/merge kernels (NVIDIA only)
 USE_TF32X3_AFFINE_CHAIN = os.environ.get('FLA_INTRACARD_TF32X3', '0') == '1'
 
-# the merge kernel materializes a full fp32 BK x BK transition matrix
-MAX_INTRACARD_HEAD_DIM = 128
+MAX_INTRACARD_HEAD_DIM = 256
 
 if USE_TF32X3_AFFINE_CHAIN and not IS_TF32_SUPPORTED:
     warnings.warn(

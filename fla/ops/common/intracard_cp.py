@@ -22,6 +22,7 @@ from typing import NamedTuple
 
 import torch
 import triton
+import triton.language as tl
 
 from fla.ops.common.chunk_delta_h import (
     chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
@@ -414,6 +415,99 @@ def intracard_pre_scan_bwd(
     return dhm
 
 
+@triton.jit(do_not_specialize=['STEP', 'NUM_SEQ_ENTRIES'])
+def intracard_merge_kernel_tiled_step(
+    h,
+    ag_hm,
+    seq_offsets,
+    init_offsets,
+    h0_seq_ids,
+    h0,
+    STEP,
+    NUM_SEQ_ENTRIES,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BI: tl.constexpr,
+    FORWARD: tl.constexpr,
+    HAS_H0: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    AFFINE_CHAIN_PRECISION: tl.constexpr,
+):
+    i_kv = tl.program_id(0).to(tl.int64)
+    i_seq = tl.program_id(1).to(tl.int64)
+    i_h = tl.program_id(2).to(tl.int64)
+    NV: tl.constexpr = tl.cdiv(V, BV)
+    i_k, i_v = i_kv // NV, i_kv % NV
+
+    if i_seq >= NUM_SEQ_ENTRIES:
+        return
+
+    ss_start = tl.load(seq_offsets + i_seq).to(tl.int64)
+    ss_end = tl.load(seq_offsets + i_seq + 1).to(tl.int64)
+    init_base = tl.load(init_offsets + i_seq).to(tl.int64)
+    num_subseqs = ss_end - ss_start
+    step = STEP.to(tl.int64)
+    if step >= num_subseqs - 1:
+        return
+
+    if FORWARD:
+        i_ss = ss_start + step
+        out_idx = init_base + step
+        prev_idx = out_idx - 1
+    else:
+        i_ss = ss_end - 1 - step
+        out_idx = init_base + num_subseqs - 2 - step
+        prev_idx = out_idx + 1
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    stride_hm_s = HV * K * (V + K)
+    stride_hm_h = K * (V + K)
+    base = i_ss * stride_hm_s + i_h * stride_hm_h
+
+    p_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+    b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+    b_out = tl.zeros([BK, BV], dtype=tl.float32)
+
+    for i_i in range(tl.cdiv(K, BI)):
+        o_i = i_i * BI + tl.arange(0, BI)
+        m_i = o_i < K
+        p_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_i[None, :]
+        b_m = tl.load(p_m, mask=m_k[:, None] & m_i[None, :], other=0.0).to(tl.float32)
+
+        if step == 0:
+            if HAS_H0:
+                orig_seq_id = tl.load(h0_seq_ids + i_seq).to(tl.int64)
+                if STATE_V_FIRST:
+                    p_prev = h0 + (orig_seq_id * HV + i_h) * V * K + o_v[None, :] * K + o_i[:, None]
+                else:
+                    p_prev = h0 + (orig_seq_id * HV + i_h) * K * V + o_i[:, None] * V + o_v[None, :]
+                b_prev = tl.load(p_prev, mask=m_i[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+            else:
+                b_prev = tl.zeros([BI, BV], dtype=tl.float32)
+        else:
+            if STATE_V_FIRST:
+                p_prev = h + (prev_idx * HV + i_h) * V * K + o_v[None, :] * K + o_i[:, None]
+            else:
+                p_prev = h + (prev_idx * HV + i_h) * K * V + o_i[:, None] * V + o_v[None, :]
+            b_prev = tl.load(p_prev, mask=m_i[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+
+        b_out = tl.dot(b_m, b_prev, b_out, input_precision=AFFINE_CHAIN_PRECISION)
+
+    b_out += b_he
+    if STATE_V_FIRST:
+        p_out = h + (out_idx * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
+        tl.store(p_out, tl.trans(b_out), mask=m_v[:, None] & m_k[None, :])
+    else:
+        p_out = h + (out_idx * HV + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_out, b_out, mask=m_k[:, None] & m_v[None, :])
+
+
 def intracard_merge(
     hm: torch.Tensor,
     split_info: SplitSeqInfo,
@@ -459,6 +553,41 @@ def intracard_merge(
     else:
         boundary_states_merge = hm.new_empty(num_non_first, HV, K, V, dtype=torch.float32)
 
+    affine_chain_precision = (
+        "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
+        else ("ieee" if not IS_TF32_SUPPORTED else None)
+    )
+
+    if BK > 128:
+        BK_TILE = 32
+        BV_TILE = 32
+        BI_TILE = 32
+        grid = (triton.cdiv(K, BK_TILE) * triton.cdiv(V, BV_TILE), num_split_seqs, HV)
+        for step in range(max(split_info.num_subseqs) - 1):
+            intracard_merge_kernel_tiled_step[grid](
+                h=boundary_states_merge,
+                ag_hm=hm,
+                seq_offsets=seq_offsets,
+                init_offsets=init_offsets,
+                h0_seq_ids=h0_seq_ids,
+                h0=initial_state,
+                STEP=step,
+                NUM_SEQ_ENTRIES=num_split_seqs,
+                HV=HV,
+                K=K,
+                V=V,
+                BK=BK_TILE,
+                BV=BV_TILE,
+                BI=BI_TILE,
+                FORWARD=forward,
+                HAS_H0=initial_state is not None,
+                STATE_V_FIRST=state_v_first,
+                AFFINE_CHAIN_PRECISION=affine_chain_precision,
+                num_warps=4,
+                num_stages=2,
+            )
+        return boundary_states_merge, num_non_first
+
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), num_split_seqs, HV)
 
@@ -480,10 +609,7 @@ def intracard_merge(
         INTRACARD_MODE=True,
         NUM_SEQ_ENTRIES=num_split_seqs,
         STATE_V_FIRST=state_v_first,
-        AFFINE_CHAIN_PRECISION=(
-            "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
-            else ("ieee" if not IS_TF32_SUPPORTED else None)
-        ),
+        AFFINE_CHAIN_PRECISION=affine_chain_precision,
     )
 
     return boundary_states_merge, num_non_first
@@ -661,7 +787,7 @@ def intracard_fwd_h(
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens"
 
     K = k.shape[-1]
-    assert K <= 128, "intra-card merge does not support key head dimensions larger than 128"
+    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
     V = u.shape[-1]
     HV = u.shape[2]
     device = k.device
@@ -773,7 +899,7 @@ def intracard_bwd_dhu(
     assert scale is not None, "intracard_bwd_dhu requires scale"
 
     K = q.shape[-1]
-    assert K <= 128, "intra-card merge does not support key head dimensions larger than 128"
+    assert K <= 256, "current kernel does not support key head dimensions larger than 256"
     V = do.shape[-1]
     HV = do.shape[2]
     cached = _prepare_intracard_cache_entry(

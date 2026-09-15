@@ -189,7 +189,7 @@ def test_intracard_backend_verifiers():
     assert accepted is False
     assert reason == "static chunk_offsets are not supported"
 
-    oversized = torch.empty(129)
+    oversized = torch.empty(257)
     accepted, reason = backend.chunk_gated_delta_rule_fwd_h_verifier(
         k=oversized,
         w=tensor,
@@ -197,7 +197,7 @@ def test_intracard_backend_verifiers():
         cu_seqlens=tensor,
     )
     assert accepted is False
-    assert reason == "key head dimension exceeds intra-card merge limit of 128"
+    assert reason == "key head dimension exceeds intra-card merge limit of 256"
 
     accepted, reason = backend.chunk_gated_delta_rule_bwd_dhu_verifier(
         q=tensor,
@@ -237,7 +237,7 @@ def test_intracard_backend_verifiers():
         cu_seqlens=tensor,
     )
     assert accepted is False
-    assert reason == "key head dimension exceeds intra-card merge limit of 128"
+    assert reason == "key head dimension exceeds intra-card merge limit of 256"
 
 
 def test_intracard_split_metadata_uses_explicit_pairs():
@@ -261,6 +261,64 @@ def test_intracard_split_metadata_uses_explicit_pairs():
         [0, 4, 8],
         [0, 3, 6],
     )
+
+
+@pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
+@pytest.mark.parametrize(
+    ("forward", "state_v_first"),
+    [
+        pytest.param(True, False, id="forward-k-first"),
+        pytest.param(False, True, id="backward-v-first"),
+    ],
+)
+def test_intracard_tiled_merge_k256(forward: bool, state_v_first: bool):
+    torch.manual_seed(42)
+    K, V, HV = 256, 96, 2
+    split_info = intracard_cp_mod.SplitSeqInfo(
+        split_seq_ids=[0, 2],
+        start_subseq_idx=[0, 3],
+        num_subseqs=[3, 2],
+    )
+    merge_seq_offsets = [0, 3, 5]
+    merge_init_offsets = [0, 2, 3]
+    num_non_first = 3
+
+    hm = torch.empty(5, HV, K, V + K, device=device, dtype=torch.float32)
+    hm[..., :V] = torch.randn(5, HV, K, V, device=device, dtype=torch.float32) * 0.01
+    identity = torch.eye(K, device=device, dtype=torch.float32).view(1, 1, K, K)
+    hm[..., V:] = identity + torch.randn(5, HV, K, K, device=device, dtype=torch.float32) * 0.001
+
+    state_shape = (3, HV, V, K) if state_v_first else (3, HV, K, V)
+    initial_state = torch.randn(state_shape, device=device, dtype=torch.float32) * 0.01
+    expected_shape = (num_non_first, HV, V, K) if state_v_first else (num_non_first, HV, K, V)
+    expected = torch.empty(expected_shape, device=device, dtype=torch.float32)
+
+    for i_seq, (orig_seq_id, num_subseqs) in enumerate(zip(split_info.split_seq_ids, split_info.num_subseqs)):
+        state = initial_state[orig_seq_id]
+        if state_v_first:
+            state = state.transpose(-1, -2)
+        ss_start, ss_end = merge_seq_offsets[i_seq:i_seq + 2]
+        init_base = merge_init_offsets[i_seq]
+        for step in range(num_subseqs - 1):
+            i_ss = ss_start + step if forward else ss_end - 1 - step
+            out_idx = init_base + step if forward else init_base + num_subseqs - 2 - step
+            state = hm[i_ss, ..., V:] @ state + hm[i_ss, ..., :V]
+            expected[out_idx] = state.transpose(-1, -2) if state_v_first else state
+
+    actual, actual_num_non_first = intracard_cp_mod.intracard_merge(
+        hm=hm,
+        split_info=split_info,
+        num_non_first=num_non_first,
+        merge_seq_offsets=merge_seq_offsets,
+        merge_init_offsets=merge_init_offsets,
+        device=device,
+        initial_state=initial_state,
+        state_v_first=state_v_first,
+        forward=forward,
+    )
+
+    assert actual_num_non_first == num_non_first
+    assert_close("merge", expected, actual, 0.005)
 
 
 @pytest.mark.skipif(os.environ.get("FLA_DISABLE_BACKEND_DISPATCH") == "1", reason="backend dispatch disabled")
@@ -424,12 +482,22 @@ def test_intracard_training_route_parity(monkeypatch, operation: str, state_v_fi
 @pytest.mark.skipif(os.environ.get("FLA_DISABLE_BACKEND_DISPATCH") == "1", reason="backend dispatch disabled")
 @pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
 @pytest.mark.parametrize(
-    ("K", "V", "H", "HV", "gate_mode", "use_qk_l2norm_in_kernel", "disable_recompute", "cu_seqlens_values"),
+    (
+        "K",
+        "V",
+        "H",
+        "HV",
+        "BT",
+        "gate_mode",
+        "use_qk_l2norm_in_kernel",
+        "disable_recompute",
+        "cu_seqlens_values",
+    ),
     [
-        pytest.param(128, 128, 64, 64, "precomputed", False, False, [0, 192, 576], id="pregated-mha-k128-ragged"),
-        pytest.param(128, 128, 1, 2, "precomputed", True, False, [0, 448], id="pregated-gva-k128"),
-        pytest.param(128, 96, 1, 1, "fused", True, False, [0, 384], id="fused-gate-beta"),
-        pytest.param(128, 96, 1, 1, "safe-fused", False, True, [0, 384], id="safe-fused-save-intermediates"),
+        pytest.param(128, 128, 64, 64, 64, "precomputed", False, False, [0, 192, 576], id="pregated-mha-k128-ragged"),
+        pytest.param(256, 128, 1, 2, 32, "precomputed", True, False, [0, 448], id="pregated-gva-k256-bt32"),
+        pytest.param(128, 96, 1, 1, 64, "fused", True, False, [0, 384], id="fused-gate-beta"),
+        pytest.param(128, 96, 1, 1, 64, "safe-fused", False, True, [0, 384], id="safe-fused-save-intermediates"),
     ],
 )
 def test_intracard_kda_training_modes(
@@ -438,13 +506,14 @@ def test_intracard_kda_training_modes(
     V: int,
     H: int,
     HV: int,
+    BT: int,
     gate_mode: str,
     use_qk_l2norm_in_kernel: bool,
     disable_recompute: bool,
     cu_seqlens_values: list[int],
 ):
     torch.manual_seed(42)
-    B, T, BT = 1, cu_seqlens_values[-1], 64
+    B, T = 1, cu_seqlens_values[-1]
     dtype = torch.bfloat16
     q = torch.randn(B, T, H, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)
