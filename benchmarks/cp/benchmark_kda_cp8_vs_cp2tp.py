@@ -77,34 +77,54 @@ def all_gather(x, group=None) -> torch.Tensor:
 
 
 def bench(fn, step=20, warm_up=10, grad_to_none=None):
-    """Benchmark function with CUDA events."""
+    """Benchmark function with CUDA events.
+
+    Clear leaf gradients after every iteration so each measured backward
+    starts from grad=None instead of accumulating into an existing .grad.
+    """
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     # Warmup
-    for i in range(warm_up):
+    for _ in range(warm_up):
         fn()
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
 
-    # Benchmark
+    # Make sure warmup work is finished before timing.
     torch.cuda.synchronize()
+
+    # Benchmark
     start_event.record()
-    for i in range(step):
+    for _ in range(step):
         fn()
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
     end_event.record()
+
     torch.cuda.synchronize()
 
     elapsed_time = start_event.elapsed_time(end_event)
     return elapsed_time / step
 
 
-def profile_kernels(fn, rank, steps=5, warmup=2):
-    """Profile individual kernels using PyTorch profiler."""
+def profile_kernels(fn, rank, steps=5, warmup=2, grad_to_none=None):
+    """Profile individual kernels using PyTorch profiler.
+
+    Clear leaf gradients after every iteration so profiler results do not
+    include aten::add_ kernels caused by cross-iteration grad accumulation.
+    """
     # Warmup
     for _ in range(warmup):
         fn()
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+
+    # Ensure warmup kernels are complete before profiling.
+    torch.cuda.synchronize()
 
     # Profile
     with torch.profiler.profile(
@@ -121,6 +141,9 @@ def profile_kernels(fn, rank, steps=5, warmup=2):
         for _ in range(steps + 1):
             torch.cuda.synchronize()
             fn()
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
             torch.cuda.synchronize()
             prof.step()
 
@@ -386,7 +409,13 @@ def run_benchmark(args):
         print("Profiling CP kernels (Rank 0 only)")
         print(f"{'='*60}\n")
 
-        kernel_stats = profile_kernels(kda_with_cp, rank, steps=5, warmup=2)
+        kernel_stats = profile_kernels(
+            kda_with_cp,
+            rank,
+            steps=5,
+            warmup=2,
+            grad_to_none=[q, k, v, g, beta] if run_backward else None,
+        )
         print(format_kernel_table(kernel_stats, top_n=20))
         print()
 
