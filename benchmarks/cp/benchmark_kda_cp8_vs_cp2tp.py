@@ -18,7 +18,7 @@ Usage:
     # CP8 with baseline comparison (test local 32k and scale to 128k)
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 131072 --backward --with-baseline
 
-    # CP8 with detailed kernel profiling (rank 0 only)
+    # CP8 with detailed kernel profiling (all ranks participate; rank 0 reports)
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 131072 --forward-only --profile-kernels
 
     # CP2TP configuration
@@ -31,6 +31,7 @@ import random
 
 import torch
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather as autograd_all_gather
 
 from fla.ops.cp import build_cp_context
 from fla.ops.kda import chunk_kda
@@ -52,7 +53,11 @@ def get_args():
     parser.add_argument("--backward", action="store_true", help="Enable backward pass (default: forward only)")
     parser.add_argument("--forward-only", action="store_true", help="Only run forward pass")
     parser.add_argument("--with-baseline", action="store_true", help="Also test single-GPU baseline (local seqlen / cp_size)")
-    parser.add_argument("--profile-kernels", action="store_true", help="Profile individual kernels (rank 0 only)")
+    parser.add_argument(
+        "--profile-kernels",
+        action="store_true",
+        help="Profile individual kernels on all ranks and report rank 0",
+    )
     parser.add_argument("--bench", action="store_true", default=True, help="Run benchmark")
     parser.add_argument("--steps", type=int, default=20, help="Benchmark steps")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup steps")
@@ -70,10 +75,8 @@ def print_rank0(*args, **kwargs):
 
 
 def all_gather(x, group=None) -> torch.Tensor:
-    world_size = dist.get_world_size(group=group)
-    y = torch.empty(world_size * x.size(0), *x.shape[1:], device=x.device, dtype=x.dtype)
-    dist.all_gather_into_tensor(y, x, group=group)
-    return y
+    """Differentiable all-gather concatenated along the leading dimension."""
+    return torch.cat(autograd_all_gather(x, group=group), dim=0)
 
 
 def bench(fn, step=20, warm_up=10, grad_to_none=None):
@@ -208,14 +211,25 @@ def run_benchmark(args):
     cp_rank = rank // tp_size
     tp_rank = rank % tp_size
 
-    # Create CP and TP groups
-    # CP group: ranks that share the same TP rank (communicate along sequence dimension)
-    cp_ranks = [i for i in range(tp_rank, world_size, tp_size)]
-    # TP group: ranks that share the same CP rank (communicate along head dimension)
-    tp_ranks = [i for i in range(cp_rank * tp_size, (cp_rank + 1) * tp_size)]
+    # All ranks must create every subgroup in the same global order.
+    # CP groups contain ranks sharing a TP rank and communicate along sequence.
+    cp_group = None
+    for tp_idx in range(tp_size):
+        ranks = list(range(tp_idx, world_size, tp_size))
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            cp_group = group
 
-    cp_group = dist.new_group(cp_ranks)
-    tp_group = dist.new_group(tp_ranks)
+    # TP groups contain ranks sharing a CP rank and communicate along heads.
+    tp_group = None
+    for cp_idx in range(cp_size):
+        ranks = list(range(cp_idx * tp_size, (cp_idx + 1) * tp_size))
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            tp_group = group
+
+    assert cp_group is not None
+    assert tp_group is not None
 
     # Model dimensions
     B = args.batch
@@ -257,7 +271,7 @@ def run_benchmark(args):
     if test_baseline:
         print_rank0(f"Baseline: Single-GPU {T_baseline} (scale to {T_total})")
     if profile_kernels_flag:
-        print_rank0("Kernel Profiling: Enabled (rank 0 only)")
+        print_rank0("Kernel Profiling: Enabled (all ranks, reporting rank 0)")
     print_rank0(f"{'='*60}\n")
 
     # No varlen for simplicity - fixed length sequences
@@ -403,11 +417,12 @@ def run_benchmark(args):
     # Warmup CUDA
     torch.cuda.synchronize()
 
-    # Run kernel profiling (rank 0 only)
-    if profile_kernels_flag and rank == 0:
-        print(f"\n{'='*60}")
-        print("Profiling CP kernels (Rank 0 only)")
-        print(f"{'='*60}\n")
+    # All ranks run the workload because it contains distributed collectives.
+    if profile_kernels_flag:
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print("Profiling CP kernels (all ranks, reporting rank 0)")
+            print(f"{'='*60}\n")
 
         kernel_stats = profile_kernels(
             kda_with_cp,
@@ -416,8 +431,10 @@ def run_benchmark(args):
             warmup=2,
             grad_to_none=[q, k, v, g, beta] if run_backward else None,
         )
-        print(format_kernel_table(kernel_stats, top_n=20))
-        print()
+
+        if rank == 0:
+            print(format_kernel_table(kernel_stats, top_n=20))
+            print()
 
     # Run benchmarks
     if args.bench:
@@ -468,15 +485,19 @@ def run_benchmark(args):
 
 
 def main():
-    dist.init_process_group()
-    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(
+        device_id=torch.device("cuda", local_rank),
+    )
+
     rank = dist.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = dist.get_world_size()
 
     torch.manual_seed(rank + 42)
     torch.cuda.manual_seed(rank + 42)
     random.seed(42)
-    torch.cuda.set_device(local_rank)
 
     args = get_args()
 
