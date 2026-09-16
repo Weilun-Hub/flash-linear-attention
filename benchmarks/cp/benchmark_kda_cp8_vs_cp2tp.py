@@ -31,7 +31,10 @@ import random
 
 import torch
 import torch.distributed as dist
-from torch.distributed.nn.functional import all_gather as autograd_all_gather
+from torch.distributed.nn.functional import (
+    all_gather as autograd_all_gather,
+    all_reduce as autograd_all_reduce,
+)
 
 from fla.ops.cp import build_cp_context
 from fla.ops.kda import chunk_kda
@@ -338,7 +341,11 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            dist.all_reduce(o, group=tp_group)
+            o = autograd_all_reduce(
+                o,
+                op=dist.ReduceOp.SUM,
+                group=tp_group,
+            )
 
         dist.barrier()
         if run_backward:
@@ -375,8 +382,12 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            dist.all_reduce(o_full, group=tp_group)
-
+            o_full = autograd_all_reduce(
+                o_full,
+                op=dist.ReduceOp.SUM,
+                group=tp_group,
+            )
+        
         dist.barrier()
         if run_backward:
             if cp_size > 1:
