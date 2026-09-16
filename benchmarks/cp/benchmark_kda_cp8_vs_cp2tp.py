@@ -15,6 +15,9 @@ Usage:
     # CP8 configuration, 256k forward only
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 262144 --forward-only
 
+    # CP8 configuration, 256k backward without the memory-heavy All2All comparison
+    torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 262144 --backward --skip-all2all
+
     # CP8 with baseline comparison (test local 32k and scale to 128k)
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 131072 --backward --with-baseline
 
@@ -56,6 +59,7 @@ def get_args():
     parser.add_argument("--backward", action="store_true", help="Enable backward pass (default: forward only)")
     parser.add_argument("--forward-only", action="store_true", help="Only run forward pass")
     parser.add_argument("--with-baseline", action="store_true", help="Also test single-GPU baseline (local seqlen / cp_size)")
+    parser.add_argument("--skip-all2all", action="store_true", help="Skip the memory-heavy All2All CP comparison")
     parser.add_argument(
         "--profile-kernels",
         action="store_true",
@@ -462,10 +466,12 @@ def run_benchmark(args):
         dist.barrier()
 
         # Benchmark All2All CP (all-gather approach)
-        dist.barrier()
-        t_all2all_cp = bench(kda_with_all2all_cp, step=args.steps, warm_up=args.warmup,
-                             grad_to_none=[q, k, v, g, beta] if run_backward else None)
-        dist.barrier()
+        t_all2all_cp = None
+        if not args.skip_all2all:
+            dist.barrier()
+            t_all2all_cp = bench(kda_with_all2all_cp, step=args.steps, warm_up=args.warmup,
+                                 grad_to_none=[q, k, v, g, beta] if run_backward else None)
+            dist.barrier()
 
         # Benchmark baseline (single GPU)
         if test_baseline:
@@ -484,8 +490,11 @@ def run_benchmark(args):
             print(f"Mode: {'Forward + Backward' if run_backward else 'Forward Only'}")
             print(f"{'='*60}")
             print(f"CP time:                {t_cp:.3f} ms")
-            print(f"All2All CP time:        {t_all2all_cp:.3f} ms")
-            print(f"Speedup (vs All2All):   {t_all2all_cp / t_cp:.2f}x")
+            if t_all2all_cp is not None:
+                print(f"All2All CP time:        {t_all2all_cp:.3f} ms")
+                print(f"Speedup (vs All2All):   {t_all2all_cp / t_cp:.2f}x")
+            else:
+                print("All2All CP time:        skipped")
             if test_baseline:
                 print(f"{'='*60}")
                 print("Single-GPU Baseline:")
