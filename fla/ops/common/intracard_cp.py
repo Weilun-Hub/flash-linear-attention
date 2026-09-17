@@ -67,6 +67,15 @@ class _CacheEntry(NamedTuple):
     # GPU tensors (cached to avoid H2D transfer)
     cu_seqlens_subseq_gpu: torch.Tensor
     cu_seqlens_split_flat: torch.Tensor
+    chunk_indices_subseq: torch.Tensor
+    chunk_offsets_subseq: torch.Tensor
+    non_first_indices_gpu: torch.Tensor
+    non_last_indices_gpu: torch.Tensor
+    first_subseq_indices_gpu: torch.Tensor
+    last_subseq_indices_gpu: torch.Tensor
+    merge_seq_offsets_gpu: torch.Tensor
+    merge_init_offsets_gpu: torch.Tensor
+    split_seq_ids_gpu: torch.Tensor
 
 
 class SplitSeqInfo(NamedTuple):
@@ -96,6 +105,7 @@ def _raw_chunk_gated_delta_rule_fwd_h(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    chunk_offsets: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
     BT = chunk_size
@@ -105,7 +115,9 @@ def _raw_chunk_gated_delta_rule_fwd_h(
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
-        N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
+        N, NT = len(cu_seqlens) - 1, len(chunk_indices)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
 
     if state_v_first:
         h = k.new_empty(B, NT, HV, V, K)
@@ -519,12 +531,15 @@ def intracard_merge(
     state_v_first: bool = False,
     use_tf32x3_affine_chain: bool = False,
     forward: bool = True,
+    seq_offsets: torch.Tensor | None = None,
+    init_offsets: torch.Tensor | None = None,
+    h0_seq_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, int]:
     """Merge sub-sequence boundary states using pre-computed parameters.
 
     All CPU-side preparation (cumsum, offset lists) is done in the caller
-    using pure Python loops. This function only creates GPU tensors and
-    launches the merge kernel.
+    using pure Python loops. Cached callers provide GPU metadata tensors;
+    direct callers materialize them here before launching the merge kernel.
     """
     from fla.ops.cp.chunk_delta_h import merge_fwd_bwd_kernel
 
@@ -538,15 +553,14 @@ def intracard_merge(
 
     num_split_seqs = split_info.num_split_seqs
 
-    # Create all small GPU tensors from Python lists in one batch
-    # Merge into a single CPU→GPU transfer to minimize cudaStreamSynchronize
-    all_int_data = merge_seq_offsets + merge_init_offsets + split_info.split_seq_ids
-    all_tensor = torch.tensor(all_int_data, dtype=torch.int32, device=device)
-    n_so = len(merge_seq_offsets)
-    n_io = len(merge_init_offsets)
-    seq_offsets = all_tensor[:n_so]
-    init_offsets = all_tensor[n_so:n_so+n_io]
-    h0_seq_ids = all_tensor[n_so+n_io:]
+    if seq_offsets is None or init_offsets is None or h0_seq_ids is None:
+        all_int_data = merge_seq_offsets + merge_init_offsets + split_info.split_seq_ids
+        all_tensor = torch.tensor(all_int_data, dtype=torch.int32, device=device)
+        n_so = len(merge_seq_offsets)
+        n_io = len(merge_init_offsets)
+        seq_offsets = all_tensor[:n_so]
+        init_offsets = all_tensor[n_so:n_so+n_io]
+        h0_seq_ids = all_tensor[n_so+n_io:]
 
     if state_v_first:
         boundary_states_merge = hm.new_empty(num_non_first, HV, V, K, dtype=torch.float32)
@@ -744,6 +758,7 @@ def _prepare_intracard_cache_entry(
     ) = _precompute_intracard_indices(split_info, cu_seqlens_subseq_values, len(cu_seqlens_cpu) - 1)
 
     dtype = cu_seqlens_cpu.dtype
+    cu_seqlens_subseq_gpu = torch.tensor(cu_seqlens_subseq_values, dtype=dtype, device=device)
     cached = _CacheEntry(
         cu_seqlens_ref=weakref.ref(cu_seqlens),
         cu_seqlens_subseq_values=cu_seqlens_subseq_values,
@@ -758,8 +773,17 @@ def _prepare_intracard_cache_entry(
         num_non_first=num_non_first,
         merge_seq_offsets=merge_seq_offsets,
         merge_init_offsets=merge_init_offsets,
-        cu_seqlens_subseq_gpu=torch.tensor(cu_seqlens_subseq_values, dtype=dtype, device=device),
+        cu_seqlens_subseq_gpu=cu_seqlens_subseq_gpu,
         cu_seqlens_split_flat=torch.tensor(cu_seqlens_split_values, dtype=dtype, device=device),
+        chunk_indices_subseq=prepare_chunk_indices(cu_seqlens_subseq_gpu, chunk_size),
+        chunk_offsets_subseq=prepare_chunk_offsets(cu_seqlens_subseq_gpu, chunk_size),
+        non_first_indices_gpu=torch.tensor(non_first_indices, dtype=torch.long, device=device),
+        non_last_indices_gpu=torch.tensor(non_last_indices, dtype=torch.long, device=device),
+        first_subseq_indices_gpu=torch.tensor(first_subseq_indices, dtype=torch.long, device=device),
+        last_subseq_indices_gpu=torch.tensor(last_subseq_indices, dtype=torch.long, device=device),
+        merge_seq_offsets_gpu=torch.tensor(merge_seq_offsets, dtype=torch.int32, device=device),
+        merge_init_offsets_gpu=torch.tensor(merge_init_offsets, dtype=torch.int32, device=device),
+        split_seq_ids_gpu=torch.tensor(split_info.split_seq_ids, dtype=torch.int32, device=device),
     )
     _intracard_cache[cache_key] = cached
     while len(_intracard_cache) > _INTRACARD_CACHE_MAXSIZE:
@@ -837,6 +861,9 @@ def intracard_fwd_h(
         initial_state=initial_state,
         state_v_first=state_v_first,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        seq_offsets=cached.merge_seq_offsets_gpu,
+        init_offsets=cached.merge_init_offsets_gpu,
+        h0_seq_ids=cached.split_seq_ids_gpu,
     )
 
     if state_v_first:
@@ -845,12 +872,10 @@ def intracard_fwd_h(
         initial_state_expanded = k.new_zeros(cached.total_subseqs, HV, K, V, dtype=torch.float32)
 
     if initial_state is not None:
-        initial_state_expanded[cached.first_subseq_indices] = initial_state
+        initial_state_expanded[cached.first_subseq_indices_gpu] = initial_state
 
     if initial_states_merge is not None and num_non_first > 0:
-        initial_state_expanded[cached.non_first_indices] = initial_states_merge
-
-    chunk_indices_subseq = prepare_chunk_indices(cached.cu_seqlens_subseq_gpu, chunk_size)
+        initial_state_expanded[cached.non_first_indices_gpu] = initial_states_merge
 
     h, v_new, final_state_subseq = _raw_chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -863,12 +888,13 @@ def intracard_fwd_h(
         chunk_size=chunk_size,
         save_new_value=save_new_value,
         cu_seqlens=cached.cu_seqlens_subseq_gpu,
-        chunk_indices=chunk_indices_subseq,
+        chunk_indices=cached.chunk_indices_subseq,
+        chunk_offsets=cached.chunk_offsets_subseq,
         state_v_first=state_v_first,
     )
 
     if output_final_state and final_state_subseq is not None:
-        final_state = final_state_subseq[cached.last_subseq_indices]
+        final_state = final_state_subseq[cached.last_subseq_indices_gpu]
     else:
         final_state = final_state_subseq
 
@@ -954,6 +980,9 @@ def intracard_bwd_dhu(
         state_v_first=state_v_first,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
         forward=False,
+        seq_offsets=cached.merge_seq_offsets_gpu,
+        init_offsets=cached.merge_init_offsets_gpu,
+        h0_seq_ids=cached.split_seq_ids_gpu,
     )
 
     if state_v_first:
@@ -962,12 +991,11 @@ def intracard_bwd_dhu(
         state_shape = (cached.total_subseqs, HV, K, V)
     dht_expanded = q.new_zeros(state_shape, dtype=torch.float32)
     if dht is not None:
-        dht_expanded[cached.last_subseq_indices] = dht
+        dht_expanded[cached.last_subseq_indices_gpu] = dht
     if dht_merge is not None and num_non_first > 0:
-        dht_expanded[cached.non_last_indices] = dht_merge
+        dht_expanded[cached.non_last_indices_gpu] = dht_merge
 
     h0_expanded = q.new_empty(state_shape, dtype=torch.float32) if h0 is not None else None
-    chunk_indices_subseq = prepare_chunk_indices(cached.cu_seqlens_subseq_gpu, chunk_size)
     dh, dh0_subseq, dv2 = _raw_chunk_gated_delta_rule_bwd_dhu(
         q=q,
         k=k,
@@ -982,7 +1010,8 @@ def intracard_bwd_dhu(
         state_v_first=state_v_first,
         cu_seqlens=cached.cu_seqlens_subseq_gpu,
         chunk_size=chunk_size,
-        chunk_indices=chunk_indices_subseq,
+        chunk_indices=cached.chunk_indices_subseq,
+        chunk_offsets=cached.chunk_offsets_subseq,
     )
-    dh0 = dh0_subseq[cached.first_subseq_indices] if dh0_subseq is not None else None
+    dh0 = dh0_subseq[cached.first_subseq_indices_gpu] if dh0_subseq is not None else None
     return dh, dh0, dv2

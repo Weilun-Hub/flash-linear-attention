@@ -448,7 +448,7 @@ def run_benchmark(args):
         )
 
         if rank == 0:
-            print(format_kernel_table(kernel_stats, top_n=20))
+            print(format_kernel_table(kernel_stats, top_n=50))
             print()
 
     # Run benchmarks
