@@ -482,6 +482,7 @@ def chunk_kda_bwd(
     dt_bias: torch.Tensor | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    intra_initial_state: torch.Tensor | None = None,
     use_graph: bool = False,
     chunk_offsets: torch.LongTensor | None = None,
     **kwargs,
@@ -530,6 +531,7 @@ def chunk_kda_bwd(
             chunk_offsets=chunk_offsets,
             chunk_size=chunk_size,
             state_v_first=state_v_first,
+            intra_initial_state=intra_initial_state,
         )
     else:
         w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]

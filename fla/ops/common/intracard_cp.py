@@ -807,7 +807,14 @@ def intracard_fwd_h(
     chunk_indices: torch.LongTensor | None = None,
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    return_intra_initial_state: bool = False,
+    intra_initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens"
 
     K = k.shape[-1]
@@ -824,7 +831,7 @@ def intracard_fwd_h(
         device=device,
     )
     if cached is None:
-        return _raw_chunk_gated_delta_rule_fwd_h(
+        result = _raw_chunk_gated_delta_rule_fwd_h(
             k=k,
             w=w,
             u=u,
@@ -838,44 +845,59 @@ def intracard_fwd_h(
             chunk_indices=chunk_indices,
             state_v_first=state_v_first,
         )
-
-    hm = intracard_pre_scan(
-        kg=k,
-        w=w,
-        u=u,
-        g=g,
-        gk=gk,
-        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-        S_split=cached.S_split_total,
-        chunk_size=chunk_size,
-        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-    )
-
-    initial_states_merge, num_non_first = intracard_merge(
-        hm=hm,
-        split_info=cached.split_info,
-        num_non_first=cached.num_non_first,
-        merge_seq_offsets=cached.merge_seq_offsets,
-        merge_init_offsets=cached.merge_init_offsets,
-        device=device,
-        initial_state=initial_state,
-        state_v_first=state_v_first,
-        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        seq_offsets=cached.merge_seq_offsets_gpu,
-        init_offsets=cached.merge_init_offsets_gpu,
-        h0_seq_ids=cached.split_seq_ids_gpu,
-    )
+        return (*result, None) if return_intra_initial_state else result
 
     if state_v_first:
-        initial_state_expanded = k.new_zeros(cached.total_subseqs, HV, V, K, dtype=torch.float32)
+        state_shape = (cached.total_subseqs, HV, V, K)
     else:
-        initial_state_expanded = k.new_zeros(cached.total_subseqs, HV, K, V, dtype=torch.float32)
+        state_shape = (cached.total_subseqs, HV, K, V)
 
-    if initial_state is not None:
-        initial_state_expanded[cached.first_subseq_indices_gpu] = initial_state
+    if intra_initial_state is None:
+        hm = intracard_pre_scan(
+            kg=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+            S_split=cached.S_split_total,
+            chunk_size=chunk_size,
+            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        )
 
-    if initial_states_merge is not None and num_non_first > 0:
-        initial_state_expanded[cached.non_first_indices_gpu] = initial_states_merge
+        initial_states_merge, num_non_first = intracard_merge(
+            hm=hm,
+            split_info=cached.split_info,
+            num_non_first=cached.num_non_first,
+            merge_seq_offsets=cached.merge_seq_offsets,
+            merge_init_offsets=cached.merge_init_offsets,
+            device=device,
+            initial_state=initial_state,
+            state_v_first=state_v_first,
+            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+            seq_offsets=cached.merge_seq_offsets_gpu,
+            init_offsets=cached.merge_init_offsets_gpu,
+            h0_seq_ids=cached.split_seq_ids_gpu,
+        )
+
+        initial_state_expanded = k.new_zeros(state_shape, dtype=torch.float32)
+
+        if initial_state is not None:
+            initial_state_expanded[cached.first_subseq_indices_gpu] = initial_state
+
+        if initial_states_merge is not None and num_non_first > 0:
+            initial_state_expanded[cached.non_first_indices_gpu] = initial_states_merge
+    else:
+        # backward recomputation can reuse the fp32 split states produced by forward
+        if intra_initial_state.shape != state_shape:
+            raise ValueError(
+                f"intra_initial_state must have shape {state_shape}, got {tuple(intra_initial_state.shape)}"
+            )
+        if intra_initial_state.dtype != torch.float32:
+            raise ValueError(f"intra_initial_state must have dtype torch.float32, got {intra_initial_state.dtype}")
+        if intra_initial_state.device != device:
+            raise ValueError(f"intra_initial_state must be on {device}, got {intra_initial_state.device}")
+        initial_state_expanded = intra_initial_state
 
     h, v_new, final_state_subseq = _raw_chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -898,7 +920,8 @@ def intracard_fwd_h(
     else:
         final_state = final_state_subseq
 
-    return h, v_new, final_state
+    result = h, v_new, final_state
+    return (*result, initial_state_expanded) if return_intra_initial_state else result
 
 
 def intracard_bwd_dhu(

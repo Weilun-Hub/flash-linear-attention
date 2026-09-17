@@ -97,7 +97,8 @@ def chunk_kda_fwd(
             use_graph=use_graph,
         )
 
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    save_intra_initial_state = cu_seqlens is not None and not disable_recompute and not return_intermediate_states
+    state_result = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
         u=u,
@@ -110,7 +111,13 @@ def chunk_kda_fwd(
         chunk_offsets=chunk_offsets,
         chunk_size=chunk_size,
         state_v_first=state_v_first,
+        return_intra_initial_state=save_intra_initial_state,
     )
+    if save_intra_initial_state:
+        h, v_new, final_state, intra_initial_state = state_result
+    else:
+        h, v_new, final_state = state_result
+        intra_initial_state = None
 
     if cp_context is not None:
         # In Context Parallel (CP) mode, global initial states are not supported at the entry point.
@@ -139,4 +146,4 @@ def chunk_kda_fwd(
             h = None
         if use_gate_in_kernel:
             g = None
-    return o, final_state, g, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state
+    return o, final_state, g, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state, intra_initial_state

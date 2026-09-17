@@ -84,7 +84,21 @@ class ChunkKDAFunction(torch.autograd.Function):
 
         g_input = g
 
-        (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
+        (
+            o,
+            final_state,
+            g_cumsum,
+            Aqk,
+            Akk,
+            w,
+            u,
+            qg,
+            kg,
+            v_new,
+            h,
+            initial_state,
+            intra_initial_state,
+        ) = chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -118,7 +132,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         ctx.save_for_backward(
             q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
             w, u, qg, kg, v_new, h,
-            initial_state, cu_seqlens, chunk_indices, chunk_offsets
+            initial_state, intra_initial_state, cu_seqlens, chunk_indices, chunk_offsets
         )
         ctx.use_graph = use_graph
         ctx.chunk_size = chunk_size
@@ -145,7 +159,7 @@ class ChunkKDAFunction(torch.autograd.Function):
     ):
         (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
          w, u, qg, kg, v_new, h,
-         initial_state, cu_seqlens, chunk_indices, chunk_offsets) = (
+         initial_state, intra_initial_state, cu_seqlens, chunk_indices, chunk_offsets) = (
             ctx.saved_tensors
         )
 
@@ -180,6 +194,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             kg=kg,
             v_new=v_new,
             h=h,
+            intra_initial_state=intra_initial_state,
             use_graph=ctx.use_graph,
             chunk_offsets=chunk_offsets,
         )

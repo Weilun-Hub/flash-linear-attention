@@ -67,6 +67,8 @@ class IntraCardCPBackend(BaseBackend):
         cu_seqlens_cpu: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
         chunk_offsets: torch.LongTensor | None = None,
+        return_intra_initial_state: bool = False,
+        intra_initial_state: torch.Tensor | None = None,
     ) -> tuple[bool, str | None]:
         """Check if intracard CP should handle this call."""
         if cu_seqlens is None:
@@ -94,7 +96,14 @@ class IntraCardCPBackend(BaseBackend):
         cu_seqlens_cpu: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
         chunk_offsets: torch.LongTensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        return_intra_initial_state: bool = False,
+        intra_initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """Intra-card CP implementation of chunk_gated_delta_rule_fwd_h."""
         from fla.ops.common.intracard_cp import intracard_fwd_h
 
@@ -110,6 +119,8 @@ class IntraCardCPBackend(BaseBackend):
             max_splits=MAX_SUBSEQS,
             state_v_first=state_v_first,
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+            return_intra_initial_state=return_intra_initial_state,
+            intra_initial_state=intra_initial_state,
         )
 
     def chunk_gated_delta_rule_bwd_dhu_verifier(

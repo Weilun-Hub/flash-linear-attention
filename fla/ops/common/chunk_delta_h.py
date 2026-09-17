@@ -700,7 +700,14 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_offsets: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    return_intra_initial_state: bool = False,
+    intra_initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
     BT = chunk_size
 
@@ -744,7 +751,8 @@ def chunk_gated_delta_rule_fwd_h(
         BT=BT,
         STATE_V_FIRST=state_v_first,
     )
-    return h, v_new, final_state
+    result = h, v_new, final_state
+    return (*result, None) if return_intra_initial_state else result
 
 
 @dispatch('common')

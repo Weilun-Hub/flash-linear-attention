@@ -54,7 +54,10 @@ class TritonAscendCommonBackend(BaseBackend):
 
     def chunk_gated_delta_rule_fwd_h(self, *args, **kwargs):
         from fla.ops.common.backends.triton_ascend.chunk_delta_h import chunk_gated_delta_rule_fwd_h_npu
-        return chunk_gated_delta_rule_fwd_h_npu(*args, **kwargs)
+        return_intra_initial_state = kwargs.pop("return_intra_initial_state", False)
+        kwargs.pop("intra_initial_state", None)
+        result = chunk_gated_delta_rule_fwd_h_npu(*args, **kwargs)
+        return (*result, None) if return_intra_initial_state else result
 
     def chunk_fwd_h_verifier(self, k, v, *args, **kwargs):
         K, V = k.shape[-1], v.shape[-1]
