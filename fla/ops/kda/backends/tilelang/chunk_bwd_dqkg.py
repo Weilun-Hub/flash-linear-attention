@@ -27,6 +27,8 @@ import triton
 from fla.ops.utils import prepare_chunk_indices
 from fla.utils import check_shared_mem
 
+from ._utils import canonicalize_contiguous_strides
+
 
 @tilelang.jit(pass_configs={
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -421,6 +423,9 @@ def chunk_kda_bwd_wy_dqkg_fused_tilelang(
     scale=None, cu_seqlens=None, chunk_size=64,
     chunk_indices=None, state_v_first=False,
 ):
+    q, k, v, v_new, g, beta, A, h, do, dh, dv = (
+        canonicalize_contiguous_strides(x) for x in (q, k, v, v_new, g, beta, A, h, do, dh, dv)
+    )
     B, _, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
     # Ensure float32 inputs match kernel signature
@@ -435,12 +440,12 @@ def chunk_kda_bwd_wy_dqkg_fused_tilelang(
         scale = K ** -0.5
 
     # Outputs
-    dq = torch.empty_like(q, dtype=torch.float)
-    dk = torch.empty_like(k, dtype=torch.float)
-    dv2 = torch.empty_like(v)
-    dg = torch.empty_like(g, dtype=torch.float)
-    db = torch.empty_like(beta, dtype=torch.float)
-    dA = torch.empty_like(A, dtype=torch.float)
+    dq = torch.empty_like(q, dtype=torch.float, memory_format=torch.contiguous_format)
+    dk = torch.empty_like(k, dtype=torch.float, memory_format=torch.contiguous_format)
+    dv2 = torch.empty_like(v, memory_format=torch.contiguous_format)
+    dg = torch.empty_like(g, dtype=torch.float, memory_format=torch.contiguous_format)
+    db = torch.empty_like(beta, dtype=torch.float, memory_format=torch.contiguous_format)
+    dA = torch.empty_like(A, dtype=torch.float, memory_format=torch.contiguous_format)
 
     h_flat = h.reshape(-1, h.shape[-2], h.shape[-1])
     dh_flat = dh.reshape(-1, dh.shape[-2], dh.shape[-1])

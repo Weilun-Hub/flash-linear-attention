@@ -17,6 +17,7 @@ import fla.ops.common.backends.tilelang as common_tilelang_backend
 import fla.ops.generalized_delta_rule.dplr.backends.tilelang as dplr_tilelang_backend
 import fla.ops.kda.backends.tilelang as kda_tilelang_backend
 import fla.ops.rwkv6.backends.tilelang as rwkv6_tilelang_backend
+from fla.ops.kda.backends.tilelang._utils import canonicalize_contiguous_strides
 from fla.utils import _compat
 
 _REAL_PATH_EXISTS = Path.exists
@@ -209,3 +210,17 @@ def test_kda_tilelang_backward_use_graph_contract():
             **kwargs,
             use_graph=True,
         )
+
+
+def test_kda_tilelang_canonicalizes_singleton_stride_without_copy():
+    source = torch.arange(1 * 8 * 2 * 4).reshape(1, 8, 2, 4)
+    local = source[:, 4:].clone()
+
+    assert local.is_contiguous()
+    assert local.stride() == (64, 8, 4, 1)
+
+    canonical = canonicalize_contiguous_strides(local)
+
+    assert canonical.stride() == (32, 8, 4, 1)
+    assert canonical.data_ptr() == local.data_ptr()
+    torch.testing.assert_close(canonical, local)
