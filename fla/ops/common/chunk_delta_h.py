@@ -685,6 +685,39 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 
 
 @dispatch('common')
+def prepare_chunk_gated_delta_rule_fwd_h_affine(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> object | None:
+    """Optionally prepare a backend-specific affine summary for CP reuse."""
+    return None
+
+
+@dispatch('common')
+def prepare_chunk_gated_delta_rule_bwd_dhu_affine(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> object | None:
+    """Optionally prepare a backend-specific backward affine summary for CP reuse."""
+    return None
+
+
+@dispatch('common')
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -702,6 +735,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_offsets: torch.LongTensor | None = None,
     return_intra_initial_state: bool = False,
     intra_initial_state: torch.Tensor | None = None,
+    intra_affine_summary: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
     torch.Tensor,
     torch.Tensor,
@@ -774,6 +808,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_offsets: torch.LongTensor | None = None,
     use_graph: bool = False,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    intra_affine_summary: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
     # N: the actual number of sequences in the batch with either equal or variable lengths

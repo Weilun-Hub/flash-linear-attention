@@ -795,6 +795,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     initial_state: torch.Tensor | None = None,
     context: FLACPContext = None,
     use_graph: bool = False,
+    precomputed_hm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if context is None or context.group is None:
         return initial_state
@@ -891,7 +892,17 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
                 )
         return initial_state
 
-    hm = k.new_zeros(HV, K, (V + K), dtype=torch.float32)
+    if precomputed_hm is not None:
+        expected_shape = (HV, K, V + K)
+        if precomputed_hm.shape != expected_shape:
+            raise ValueError(f"precomputed_hm must have shape {expected_shape}, got {tuple(precomputed_hm.shape)}")
+        if precomputed_hm.dtype != torch.float32 or precomputed_hm.device != k.device:
+            raise ValueError("precomputed_hm must be an fp32 tensor on the same device as k")
+        if use_graph:
+            raise ValueError("precomputed_hm is not supported with use_graph=True")
+        hm = precomputed_hm
+    else:
+        hm = k.new_zeros(HV, K, (V + K), dtype=torch.float32)
     if state_v_first:
         initial_state = k.new_zeros(N, HV, V, K, dtype=torch.float32)
     else:
@@ -905,7 +916,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
         cu_last = cu_seqlens.index_select(0, torch.stack((i_last, i_last + 1)))
     # graph mode always launches: a last rank's hm is never read, but the all-gather
     # needs every rank, and host-side flags are frozen at capture
-    if use_graph or not context.is_last_rank:
+    if precomputed_hm is None and (use_graph or not context.is_last_rank):
         BLOCK_SIZE = 32 if K <= 64 else 64
         grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
         # For DPLR, v provides the original v for computing h contributions,
@@ -982,6 +993,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     context: FLACPContext | None = None,
     chunk_size: int = 64,
     use_graph: bool = False,
+    precomputed_dhm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if context is None or context.group is None:
         return dht, initial_state
@@ -1080,7 +1092,19 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                 )
         return dht, None
 
-    dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)
+    if precomputed_dhm is not None:
+        expected_shape = (HV, K, V + K)
+        if precomputed_dhm.shape != expected_shape:
+            raise ValueError(
+                f"precomputed_dhm must have shape {expected_shape}, got {tuple(precomputed_dhm.shape)}"
+            )
+        if precomputed_dhm.dtype != torch.float32 or precomputed_dhm.device != q.device:
+            raise ValueError("precomputed_dhm must be an fp32 tensor on the same device as q")
+        if use_graph:
+            raise ValueError("precomputed_dhm is not supported with use_graph=True")
+        dhm = precomputed_dhm
+    else:
+        dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)
     if state_v_first:
         dht = q.new_zeros(N, HV, V, K, dtype=torch.float32)
     else:
@@ -1088,7 +1112,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
 
     # graph mode always launches: a first rank's dhm is never read, but the all-gather
     # needs every rank, and host-side flags are frozen at capture
-    if use_graph or not context.is_first_rank:
+    if precomputed_dhm is None and (use_graph or not context.is_first_rank):
         BLOCK_SIZE = 32 if K <= 64 else 64
         grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
         pre_process_bwd_kernel_merged[grid](

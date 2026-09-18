@@ -78,6 +78,15 @@ class _CacheEntry(NamedTuple):
     split_seq_ids_gpu: torch.Tensor
 
 
+class IntraCardAffineSummary(NamedTuple):
+    """Explicitly prepared affine summaries shared by CP and intra-card scans."""
+
+    cache: _CacheEntry
+    per_split: torch.Tensor
+    per_rank: torch.Tensor
+    forward: bool
+
+
 class SplitSeqInfo(NamedTuple):
     """Information about split sequences (Python lists for zero-overhead access)."""
     split_seq_ids: list[int]       # [num_split_seqs] original sequence indices
@@ -425,6 +434,80 @@ def intracard_pre_scan_bwd(
         ),
     )
     return dhm
+
+
+@triton.jit
+def compose_affine_summaries_kernel(
+    hm,
+    rank_hm,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BC: tl.constexpr,
+    NUM_SUMMARIES: tl.constexpr,
+    FORWARD: tl.constexpr,
+):
+    """Compose per-split ``[E | M]`` transforms with IEEE fp32 dots."""
+    i_c = tl.program_id(0).to(tl.int64)
+    i_h = tl.program_id(1).to(tl.int64)
+    o_k = tl.arange(0, BK)
+    o_c = i_c * BC + tl.arange(0, BC)
+    m_k = o_k < K
+    m_c = o_c < V + K
+
+    stride_s = HV * K * (V + K)
+    stride_h = K * (V + K)
+    first_s = 0 if FORWARD else NUM_SUMMARIES - 1
+    first_base = first_s * stride_s + i_h * stride_h
+    p_first = hm + first_base + o_k[:, None] * (V + K) + o_c[None, :]
+    b_affine = tl.load(p_first, mask=m_k[:, None] & m_c[None, :], other=0.0).to(tl.float32)
+
+    for idx in range(1, NUM_SUMMARIES):
+        i_s = idx if FORWARD else NUM_SUMMARIES - 1 - idx
+        base = i_s * stride_s + i_h * stride_h
+        p_m = hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+        b_m = tl.load(p_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        b_affine = tl.dot(b_m, b_affine, allow_tf32=False)
+
+        p_e = hm + base + o_k[:, None] * (V + K) + o_c[None, :]
+        b_e = tl.load(p_e, mask=m_k[:, None] & (o_c[None, :] < V), other=0.0).to(tl.float32)
+        b_affine += b_e
+
+    p_out = rank_hm + i_h * stride_h + o_k[:, None] * (V + K) + o_c[None, :]
+    tl.store(p_out, b_affine, mask=m_k[:, None] & m_c[None, :])
+
+
+def compose_affine_summaries(
+    hm: torch.Tensor,
+    *,
+    forward: bool,
+    use_tf32x3_affine_chain: bool = False,
+) -> torch.Tensor:
+    """Return the affine composition of a single sequence's split summaries."""
+    num_summaries, HV, K, width = hm.shape
+    V = width - K
+    if not 16 <= K <= 128:
+        raise ValueError(f"affine-summary composition supports 16 <= K <= 128, got K={K}")
+
+    rank_hm = hm.new_empty(HV, K, V + K)
+    BK = triton.next_power_of_2(K)
+    BC = 32
+    grid = (triton.cdiv(V + K, BC), HV)
+    compose_affine_summaries_kernel[grid](
+        hm=hm,
+        rank_hm=rank_hm,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BC=BC,
+        NUM_SUMMARIES=num_summaries,
+        FORWARD=forward,
+        num_warps=4,
+        num_stages=2,
+    )
+    return rank_hm
 
 
 @triton.jit(do_not_specialize=['STEP', 'NUM_SEQ_ENTRIES'])
@@ -791,6 +874,110 @@ def _prepare_intracard_cache_entry(
     return cached
 
 
+def prepare_intracard_fwd_affine_summary(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    max_splits: int = 32,
+    use_tf32x3_affine_chain: bool = False,
+) -> IntraCardAffineSummary | None:
+    """Prepare summaries once for a single contiguous CP sequence.
+
+    Packed inputs retain the existing path because composing one rank summary
+    requires preserving which local sequence continues across each CP rank.
+    """
+    K = k.shape[-1]
+    if cu_seqlens is None or cu_seqlens.numel() != 2 or not 16 <= K <= 128:
+        return None
+
+    cached = _prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        num_heads=u.shape[2],
+        chunk_size=chunk_size,
+        max_splits=max_splits,
+        device=k.device,
+    )
+    if cached is None or cached.split_info.num_split_seqs != 1:
+        return None
+
+    hm = intracard_pre_scan(
+        kg=k,
+        w=w,
+        u=u,
+        g=g,
+        gk=gk,
+        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+        S_split=cached.S_split_total,
+        chunk_size=chunk_size,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+    )
+    rank_hm = compose_affine_summaries(
+        hm,
+        forward=True,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+    )
+    return IntraCardAffineSummary(cache=cached, per_split=hm, per_rank=rank_hm, forward=True)
+
+
+def prepare_intracard_bwd_affine_summary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    max_splits: int = 32,
+    use_tf32x3_affine_chain: bool = False,
+) -> IntraCardAffineSummary | None:
+    """Prepare backward summaries once for CP and the local reverse scan."""
+    K = q.shape[-1]
+    if scale is None or cu_seqlens is None or cu_seqlens.numel() != 2 or not 16 <= K <= 128:
+        return None
+
+    cached = _prepare_intracard_cache_entry(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        num_heads=do.shape[2],
+        chunk_size=chunk_size,
+        max_splits=max_splits,
+        device=q.device,
+    )
+    if cached is None or cached.split_info.num_split_seqs != 1:
+        return None
+
+    dhm = intracard_pre_scan_bwd(
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        gk=gk,
+        scale=scale,
+        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+        S_split=cached.S_split_total,
+        chunk_size=chunk_size,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+    )
+    rank_dhm = compose_affine_summaries(
+        dhm,
+        forward=False,
+        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+    )
+    return IntraCardAffineSummary(cache=cached, per_split=dhm, per_rank=rank_dhm, forward=False)
+
+
 def intracard_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -809,6 +996,7 @@ def intracard_fwd_h(
     use_tf32x3_affine_chain: bool = False,
     return_intra_initial_state: bool = False,
     intra_initial_state: torch.Tensor | None = None,
+    intra_affine_summary: IntraCardAffineSummary | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
     torch.Tensor,
     torch.Tensor,
@@ -822,14 +1010,19 @@ def intracard_fwd_h(
     V = u.shape[-1]
     HV = u.shape[2]
     device = k.device
-    cached = _prepare_intracard_cache_entry(
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        num_heads=HV,
-        chunk_size=chunk_size,
-        max_splits=max_splits,
-        device=device,
-    )
+    if intra_affine_summary is not None:
+        if not intra_affine_summary.forward:
+            raise ValueError("forward state scan received a backward affine summary")
+        cached = intra_affine_summary.cache
+    else:
+        cached = _prepare_intracard_cache_entry(
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            num_heads=HV,
+            chunk_size=chunk_size,
+            max_splits=max_splits,
+            device=device,
+        )
     if cached is None:
         result = _raw_chunk_gated_delta_rule_fwd_h(
             k=k,
@@ -853,17 +1046,20 @@ def intracard_fwd_h(
         state_shape = (cached.total_subseqs, HV, K, V)
 
     if intra_initial_state is None:
-        hm = intracard_pre_scan(
-            kg=k,
-            w=w,
-            u=u,
-            g=g,
-            gk=gk,
-            cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-            S_split=cached.S_split_total,
-            chunk_size=chunk_size,
-            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        )
+        if intra_affine_summary is not None:
+            hm = intra_affine_summary.per_split
+        else:
+            hm = intracard_pre_scan(
+                kg=k,
+                w=w,
+                u=u,
+                g=g,
+                gk=gk,
+                cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+                S_split=cached.S_split_total,
+                chunk_size=chunk_size,
+                use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+            )
 
         initial_states_merge, num_non_first = intracard_merge(
             hm=hm,
@@ -943,6 +1139,7 @@ def intracard_bwd_dhu(
     chunk_offsets: torch.LongTensor | None = None,
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
+    intra_affine_summary: IntraCardAffineSummary | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     assert cu_seqlens is not None, "intracard_bwd_dhu requires cu_seqlens"
     assert scale is not None, "intracard_bwd_dhu requires scale"
@@ -951,14 +1148,19 @@ def intracard_bwd_dhu(
     assert K <= 256, "current kernel does not support key head dimensions larger than 256"
     V = do.shape[-1]
     HV = do.shape[2]
-    cached = _prepare_intracard_cache_entry(
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        num_heads=HV,
-        chunk_size=chunk_size,
-        max_splits=max_splits,
-        device=q.device,
-    )
+    if intra_affine_summary is not None:
+        if intra_affine_summary.forward:
+            raise ValueError("backward state scan received a forward affine summary")
+        cached = intra_affine_summary.cache
+    else:
+        cached = _prepare_intracard_cache_entry(
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            num_heads=HV,
+            chunk_size=chunk_size,
+            max_splits=max_splits,
+            device=q.device,
+        )
     if cached is None:
         return _raw_chunk_gated_delta_rule_bwd_dhu(
             q=q,
@@ -978,20 +1180,23 @@ def intracard_bwd_dhu(
             chunk_offsets=chunk_offsets,
         )
 
-    dhm = intracard_pre_scan_bwd(
-        q=q,
-        k=k,
-        w=w,
-        do=do,
-        dv=dv,
-        g=g,
-        gk=gk,
-        scale=scale,
-        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-        S_split=cached.S_split_total,
-        chunk_size=chunk_size,
-        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-    )
+    if intra_affine_summary is not None:
+        dhm = intra_affine_summary.per_split
+    else:
+        dhm = intracard_pre_scan_bwd(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=gk,
+            scale=scale,
+            cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+            S_split=cached.S_split_total,
+            chunk_size=chunk_size,
+            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        )
     dht_merge, num_non_first = intracard_merge(
         hm=dhm,
         split_info=cached.split_info,

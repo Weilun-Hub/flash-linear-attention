@@ -10,7 +10,11 @@ import triton
 import triton.language as tl
 
 from fla.ops.backends import dispatch
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu,
+    chunk_gated_delta_rule_fwd_h,
+    prepare_chunk_gated_delta_rule_bwd_dhu_affine,
+)
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu_pre_process, expand_h0
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
@@ -555,6 +559,27 @@ def chunk_kda_bwd(
         use_graph=use_graph,
     )
 
+    intra_affine_summary = None
+    if (
+        cp_context is not None
+        and cp_context.group is not None
+        and cp_context.layout == 'contiguous'
+        and not use_graph
+        and chunk_offsets is None
+    ):
+        intra_affine_summary = prepare_chunk_gated_delta_rule_bwd_dhu_affine(
+            q=qg,
+            k=kg,
+            w=w,
+            do=do,
+            dv=dv,
+            gk=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+        )
+
     if cp_context is not None:
         # initial_state is None in the CP mode
         # We only need to compute dht of current rank and pass it to the backward kernel
@@ -573,8 +598,12 @@ def chunk_kda_bwd(
             chunk_size=chunk_size,
             state_v_first=state_v_first,
             use_graph=use_graph,
+            precomputed_dhm=(intra_affine_summary.per_rank if intra_affine_summary is not None else None),
         )
 
+    intra_summary_kwargs = (
+        {"intra_affine_summary": intra_affine_summary} if intra_affine_summary is not None else {}
+    )
     dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
         q=qg,
         k=kg,
@@ -591,6 +620,7 @@ def chunk_kda_bwd(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
         state_v_first=state_v_first,
+        **intra_summary_kwargs,
     )
 
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(

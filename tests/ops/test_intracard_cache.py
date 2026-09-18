@@ -264,6 +264,40 @@ def test_intracard_split_metadata_uses_explicit_pairs():
 
 
 @pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
+@pytest.mark.parametrize("forward", [True, False])
+def test_compose_affine_summaries(forward: bool):
+    torch.manual_seed(42)
+    S, HV, K, V = 4, 2, 32, 48
+    hm = torch.empty(S, HV, K, V + K, device=device, dtype=torch.float32)
+    hm[..., :V] = torch.randn(S, HV, K, V, device=device, dtype=torch.float32) * 0.01
+    identity = torch.eye(K, device=device, dtype=torch.float32).view(1, 1, K, K)
+    hm[..., V:] = identity + torch.randn(S, HV, K, K, device=device, dtype=torch.float32) * 0.001
+
+    old_allow_tf32 = None
+    if device_platform == "cuda":
+        old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        expected = torch.cat(
+            (
+                torch.zeros(HV, K, V, device=device, dtype=torch.float32),
+                torch.eye(K, device=device, dtype=torch.float32).expand(HV, K, K),
+            ),
+            dim=-1,
+        )
+        indices = range(S) if forward else range(S - 1, -1, -1)
+        for i in indices:
+            expected = hm[i, ..., V:] @ expected
+            expected[..., :V] += hm[i, ..., :V]
+    finally:
+        if old_allow_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+
+    actual = intracard_cp_mod.compose_affine_summaries(hm, forward=forward)
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
 @pytest.mark.parametrize(
     ("forward", "state_v_first"),
     [

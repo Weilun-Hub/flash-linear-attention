@@ -51,6 +51,64 @@ class IntraCardCPBackend(BaseBackend):
     def is_available(cls) -> bool:
         return True
 
+    def prepare_chunk_gated_delta_rule_fwd_h_affine(
+        self,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        u: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+        chunk_size: int = 64,
+    ) -> object | None:
+        from fla.ops.common.intracard_cp import prepare_intracard_fwd_affine_summary
+
+        return prepare_intracard_fwd_affine_summary(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+            max_splits=MAX_SUBSEQS,
+            use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+        )
+
+    def prepare_chunk_gated_delta_rule_bwd_dhu_affine(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        scale: float | None = None,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+        chunk_size: int = 64,
+    ) -> object | None:
+        from fla.ops.common.intracard_cp import prepare_intracard_bwd_affine_summary
+
+        return prepare_intracard_bwd_affine_summary(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=gk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+            max_splits=MAX_SUBSEQS,
+            use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+        )
+
     def chunk_gated_delta_rule_fwd_h_verifier(
         self,
         k: torch.Tensor,
@@ -69,6 +127,7 @@ class IntraCardCPBackend(BaseBackend):
         chunk_offsets: torch.LongTensor | None = None,
         return_intra_initial_state: bool = False,
         intra_initial_state: torch.Tensor | None = None,
+        intra_affine_summary: object | None = None,
     ) -> tuple[bool, str | None]:
         """Check if intracard CP should handle this call."""
         if cu_seqlens is None:
@@ -98,6 +157,7 @@ class IntraCardCPBackend(BaseBackend):
         chunk_offsets: torch.LongTensor | None = None,
         return_intra_initial_state: bool = False,
         intra_initial_state: torch.Tensor | None = None,
+        intra_affine_summary: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
         torch.Tensor,
         torch.Tensor,
@@ -121,6 +181,7 @@ class IntraCardCPBackend(BaseBackend):
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
             return_intra_initial_state=return_intra_initial_state,
             intra_initial_state=intra_initial_state,
+            intra_affine_summary=intra_affine_summary,
         )
 
     def chunk_gated_delta_rule_bwd_dhu_verifier(
@@ -142,6 +203,7 @@ class IntraCardCPBackend(BaseBackend):
         chunk_offsets: torch.LongTensor | None = None,
         use_graph: bool = False,
         cu_seqlens_cpu: torch.LongTensor | None = None,
+        intra_affine_summary: object | None = None,
     ) -> tuple[bool, str | None]:
         if cu_seqlens is None:
             return False, "cu_seqlens is None"
@@ -176,6 +238,7 @@ class IntraCardCPBackend(BaseBackend):
         chunk_offsets: torch.LongTensor | None = None,
         use_graph: bool = False,
         cu_seqlens_cpu: torch.LongTensor | None = None,
+        intra_affine_summary: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         from fla.ops.common.intracard_cp import intracard_bwd_dhu
 
@@ -198,4 +261,5 @@ class IntraCardCPBackend(BaseBackend):
             chunk_offsets=chunk_offsets,
             max_splits=MAX_SUBSEQS,
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+            intra_affine_summary=intra_affine_summary,
         )

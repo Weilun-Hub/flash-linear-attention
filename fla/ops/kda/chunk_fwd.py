@@ -7,7 +7,10 @@
 
 import torch
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+    prepare_chunk_gated_delta_rule_fwd_h_affine,
+)
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_fwd_h_pre_process, compress_h0
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
@@ -83,6 +86,24 @@ def chunk_kda_fwd(
         use_graph=use_graph,
     )
 
+    intra_affine_summary = None
+    if (
+        cp_context is not None
+        and cp_context.group is not None
+        and cp_context.layout == 'contiguous'
+        and not use_graph
+        and chunk_offsets is None
+    ):
+        intra_affine_summary = prepare_chunk_gated_delta_rule_fwd_h_affine(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_size=chunk_size,
+        )
+
     if cp_context is not None:
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
             k=kg,
@@ -95,9 +116,13 @@ def chunk_kda_fwd(
             chunk_size=chunk_size,
             state_v_first=state_v_first,
             use_graph=use_graph,
+            precomputed_hm=(intra_affine_summary.per_rank if intra_affine_summary is not None else None),
         )
 
     save_intra_initial_state = cu_seqlens is not None and not disable_recompute and not return_intermediate_states
+    intra_summary_kwargs = (
+        {"intra_affine_summary": intra_affine_summary} if intra_affine_summary is not None else {}
+    )
     state_result = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -112,6 +137,7 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
         state_v_first=state_v_first,
         return_intra_initial_state=save_intra_initial_state,
+        **intra_summary_kwargs,
     )
     if save_intra_initial_state:
         h, v_new, final_state, intra_initial_state = state_result
