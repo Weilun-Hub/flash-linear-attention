@@ -562,14 +562,14 @@ def merge_flat_affine_summaries_kernel(
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     stride_s = HV * K * (V + K)
     stride_h = K * (V + K)
-    local_start: tl.constexpr = RANK * NUM_LOCAL_SUMMARIES
-    local_end: tl.constexpr = local_start + NUM_LOCAL_SUMMARIES
+    local_start = RANK * NUM_LOCAL_SUMMARIES
+    local_end = local_start + NUM_LOCAL_SUMMARIES
 
     for step in range(NUM_GLOBAL_SUMMARIES):
-        i_s: tl.constexpr = step if FORWARD else NUM_GLOBAL_SUMMARIES - 1 - step
+        i_s = step if FORWARD else NUM_GLOBAL_SUMMARIES - 1 - step
         if i_s >= local_start:
             if i_s < local_end:
-                i_local: tl.constexpr = i_s - local_start
+                i_local = i_s - local_start
                 if STATE_V_FIRST:
                     p_out = boundary_states + (i_local * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
                     tl.store(p_out, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
