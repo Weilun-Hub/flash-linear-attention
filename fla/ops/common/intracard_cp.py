@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -29,8 +30,9 @@ from fla.ops.common.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
 from fla.ops.cp.chunk_delta_h import pre_process_bwd_kernel_merged, pre_process_fwd_kernel_merged
+from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
-from fla.utils import IS_TF32_SUPPORTED, get_multiprocessor_count
+from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs, get_multiprocessor_count
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Key: object identity and contents of cu_seqlens plus split configuration
 _intracard_cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
 _INTRACARD_CACHE_MAXSIZE = 32
+_FLAT_AFFINE_MAX_SUMMARIES = 32
 
 
 class _CacheEntry(NamedTuple):
@@ -81,10 +84,12 @@ class _CacheEntry(NamedTuple):
 class IntraCardAffineSummary(NamedTuple):
     """Explicitly prepared affine summaries shared by CP and intra-card scans."""
 
-    cache: _CacheEntry
+    cache: _CacheEntry | None
     per_split: torch.Tensor
-    per_rank: torch.Tensor
+    per_rank: torch.Tensor | None
     forward: bool
+    use_tf32x3_affine_chain: bool
+    boundary_states: torch.Tensor | None = None
 
 
 class SplitSeqInfo(NamedTuple):
@@ -255,15 +260,14 @@ def compute_subseq_len(
 
     # Target splits: saturate SMs with the longest sequence alone.
     # Each sub-seq contributes NUM_V_BLOCKS * num_heads blocks.
-    # Always at least 4 — for linear recurrence, CP4 always helps.
     NUM_V_BLOCKS = 2
-    target_splits = max(4, num_sms // (NUM_V_BLOCKS * num_heads))
+    target_splits = max(1, num_sms // (NUM_V_BLOCKS * num_heads))
 
     subseq_chunks = (seq_chunks + target_splits - 1) // target_splits
 
     # Floor: prevent subseq_len from being too small.
     # With chunk_size=64, MIN_SUBSEQ_CHUNKS=128 → subseq_len >= 8192 tokens,
-    # split threshold (3 * subseq_len) = 24576 tokens.
+    # split threshold (2 * subseq_len) = 16384 tokens.
     # Sequences shorter than it won't be split.
     MIN_SUBSEQ_CHUNKS = 128
     subseq_chunks = max(subseq_chunks, MIN_SUBSEQ_CHUNKS)
@@ -292,7 +296,7 @@ def prepare_subseq_cu_seqlens(
         return cu_seqlens_cpu.tolist(), False, 0
 
     subseq_chunks = (subseq_len + chunk_size - 1) // chunk_size
-    threshold_subseq_len = 3 * subseq_len
+    threshold_subseq_len = 2 * subseq_len
 
     split_seq_ids: list[int] = []
     start_subseq_idxs: list[int] = []
@@ -436,6 +440,16 @@ def intracard_pre_scan_bwd(
     return dhm
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BC': BC}, num_warps=num_warps, num_stages=num_stages)
+        for BC in [32, 64]
+        for num_warps in [4, 8]
+        for num_stages in [1, 2]
+    ],
+    key=['HV', 'K', 'V', 'NUM_SUMMARIES', 'FORWARD', 'AFFINE_CHAIN_PRECISION'],
+    **autotune_cache_kwargs,
+)
 @triton.jit
 def compose_affine_summaries_kernel(
     hm,
@@ -447,8 +461,9 @@ def compose_affine_summaries_kernel(
     BC: tl.constexpr,
     NUM_SUMMARIES: tl.constexpr,
     FORWARD: tl.constexpr,
+    AFFINE_CHAIN_PRECISION: tl.constexpr,
 ):
-    """Compose per-split ``[E | M]`` transforms with IEEE fp32 dots."""
+    """Compose per-split ``[E | M]`` transforms."""
     i_c = tl.program_id(0).to(tl.int64)
     i_h = tl.program_id(1).to(tl.int64)
     o_k = tl.arange(0, BK)
@@ -468,7 +483,7 @@ def compose_affine_summaries_kernel(
         base = i_s * stride_s + i_h * stride_h
         p_m = hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
         b_m = tl.load(p_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-        b_affine = tl.dot(b_m, b_affine, allow_tf32=False)
+        b_affine = tl.dot(b_m, b_affine, input_precision=AFFINE_CHAIN_PRECISION)
 
         p_e = hm + base + o_k[:, None] * (V + K) + o_c[None, :]
         b_e = tl.load(p_e, mask=m_k[:, None] & (o_c[None, :] < V), other=0.0).to(tl.float32)
@@ -487,13 +502,17 @@ def compose_affine_summaries(
     """Return the affine composition of a single sequence's split summaries."""
     num_summaries, HV, K, width = hm.shape
     V = width - K
+    if num_summaries == 1:
+        return hm[0]
     if not 16 <= K <= 128:
         raise ValueError(f"affine-summary composition supports 16 <= K <= 128, got K={K}")
 
     rank_hm = hm.new_empty(HV, K, V + K)
     BK = triton.next_power_of_2(K)
-    BC = 32
-    grid = (triton.cdiv(V + K, BC), HV)
+
+    def grid(meta):
+        return (triton.cdiv(V + K, meta['BC']), HV)
+
     compose_affine_summaries_kernel[grid](
         hm=hm,
         rank_hm=rank_hm,
@@ -501,13 +520,134 @@ def compose_affine_summaries(
         K=K,
         V=V,
         BK=BK,
-        BC=BC,
         NUM_SUMMARIES=num_summaries,
         FORWARD=forward,
-        num_warps=4,
-        num_stages=2,
+        AFFINE_CHAIN_PRECISION=("tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED else "ieee"),
     )
     return rank_hm
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in [32, 64]
+        for num_warps in [2, 4]
+        for num_stages in [2, 3]
+    ],
+    key=['HV', 'K', 'V', 'NUM_GLOBAL_SUMMARIES', 'FORWARD'],
+    **autotune_cache_kwargs,
+)
+@triton.jit
+def merge_flat_affine_summaries_kernel(
+    boundary_states,
+    ag_hm,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NUM_LOCAL_SUMMARIES: tl.constexpr,
+    NUM_GLOBAL_SUMMARIES: tl.constexpr,
+    RANK: tl.constexpr,
+    FORWARD: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    AFFINE_CHAIN_PRECISION: tl.constexpr,
+):
+    i_v = tl.program_id(0).to(tl.int64)
+    i_h = tl.program_id(1).to(tl.int64)
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    stride_s = HV * K * (V + K)
+    stride_h = K * (V + K)
+    local_start: tl.constexpr = RANK * NUM_LOCAL_SUMMARIES
+    local_end: tl.constexpr = local_start + NUM_LOCAL_SUMMARIES
+
+    for step in range(NUM_GLOBAL_SUMMARIES):
+        i_s: tl.constexpr = step if FORWARD else NUM_GLOBAL_SUMMARIES - 1 - step
+        if i_s >= local_start:
+            if i_s < local_end:
+                i_local: tl.constexpr = i_s - local_start
+                if STATE_V_FIRST:
+                    p_out = boundary_states + (i_local * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_out, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
+                else:
+                    p_out = boundary_states + (i_local * HV + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
+                    tl.store(p_out, b_h, mask=m_k[:, None] & m_v[None, :])
+
+        if step < NUM_GLOBAL_SUMMARIES - 1:
+            base = i_s * stride_s + i_h * stride_h
+            p_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+            b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+            p_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+            b_m = tl.load(p_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_h = tl.dot(b_m, b_h, input_precision=AFFINE_CHAIN_PRECISION) + b_he
+
+
+def merge_flat_affine_summaries(
+    summary: IntraCardAffineSummary,
+    *,
+    group: dist.ProcessGroup,
+    state_v_first: bool,
+    use_tf32x3_affine_chain: bool,
+) -> torch.Tensor | None:
+    """Return local boundary states from one global affine chain."""
+    hm = summary.per_split
+    num_local_summaries, HV, K, width = hm.shape
+    V = width - K
+    world_size = dist.get_world_size(group=group)
+    num_global_summaries = world_size * num_local_summaries
+    if num_global_summaries > _FLAT_AFFINE_MAX_SUMMARIES:
+        return None
+
+    if world_size == 1:
+        ag_hm = hm
+    else:
+        gathered_hm, _ = all_gather_into_tensor(hm, group=group)
+        ag_hm = gathered_hm.flatten(0, 1)
+
+    if state_v_first:
+        boundary_states = hm.new_empty(num_local_summaries, HV, V, K)
+    else:
+        boundary_states = hm.new_empty(num_local_summaries, HV, K, V)
+    BK = triton.next_power_of_2(K)
+    rank = dist.get_rank(group=group)
+
+    def grid(meta):
+        return (triton.cdiv(V, meta['BV']), HV)
+
+    merge_flat_affine_summaries_kernel[grid](
+        boundary_states=boundary_states,
+        ag_hm=ag_hm,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        NUM_LOCAL_SUMMARIES=num_local_summaries,
+        NUM_GLOBAL_SUMMARIES=num_global_summaries,
+        RANK=rank,
+        FORWARD=summary.forward,
+        STATE_V_FIRST=state_v_first,
+        AFFINE_CHAIN_PRECISION=(
+            "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
+            else ("ieee" if not IS_TF32_SUPPORTED else None)
+        ),
+    )
+    return boundary_states
+
+
+def materialize_rank_affine_summary(summary: IntraCardAffineSummary) -> IntraCardAffineSummary:
+    """Compose a rank summary when the flat merge is not applicable."""
+    if summary.per_rank is not None:
+        return summary
+    per_rank = compose_affine_summaries(
+        summary.per_split,
+        forward=summary.forward,
+        use_tf32x3_affine_chain=summary.use_tf32x3_affine_chain,
+    )
+    return summary._replace(per_rank=per_rank)
 
 
 @triton.jit(do_not_specialize=['STEP', 'NUM_SEQ_ENTRIES'])
@@ -886,11 +1026,7 @@ def prepare_intracard_fwd_affine_summary(
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
 ) -> IntraCardAffineSummary | None:
-    """Prepare summaries once for a single contiguous CP sequence.
-
-    Packed inputs retain the existing path because composing one rank summary
-    requires preserving which local sequence continues across each CP rank.
-    """
+    """Prepare per-split summaries once for a single contiguous CP sequence."""
     K = k.shape[-1]
     if cu_seqlens is None or cu_seqlens.numel() != 2 or not 16 <= K <= 128:
         return None
@@ -903,8 +1039,11 @@ def prepare_intracard_fwd_affine_summary(
         max_splits=max_splits,
         device=k.device,
     )
-    if cached is None or cached.split_info.num_split_seqs != 1:
+    if cached is not None and cached.split_info.num_split_seqs != 1:
         return None
+
+    split_cu_seqlens = cu_seqlens if cached is None else cached.cu_seqlens_split_flat
+    num_summaries = 1 if cached is None else cached.S_split_total
 
     hm = intracard_pre_scan(
         kg=k,
@@ -912,17 +1051,18 @@ def prepare_intracard_fwd_affine_summary(
         u=u,
         g=g,
         gk=gk,
-        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-        S_split=cached.S_split_total,
+        cu_seqlens_subseq_split=split_cu_seqlens,
+        S_split=num_summaries,
         chunk_size=chunk_size,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
     )
-    rank_hm = compose_affine_summaries(
-        hm,
+    return IntraCardAffineSummary(
+        cache=cached,
+        per_split=hm,
+        per_rank=hm[0] if num_summaries == 1 else None,
         forward=True,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
     )
-    return IntraCardAffineSummary(cache=cached, per_split=hm, per_rank=rank_hm, forward=True)
 
 
 def prepare_intracard_bwd_affine_summary(
@@ -940,7 +1080,7 @@ def prepare_intracard_bwd_affine_summary(
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
 ) -> IntraCardAffineSummary | None:
-    """Prepare backward summaries once for CP and the local reverse scan."""
+    """Prepare per-split backward summaries once for CP and the local reverse scan."""
     K = q.shape[-1]
     if scale is None or cu_seqlens is None or cu_seqlens.numel() != 2 or not 16 <= K <= 128:
         return None
@@ -953,8 +1093,11 @@ def prepare_intracard_bwd_affine_summary(
         max_splits=max_splits,
         device=q.device,
     )
-    if cached is None or cached.split_info.num_split_seqs != 1:
+    if cached is not None and cached.split_info.num_split_seqs != 1:
         return None
+
+    split_cu_seqlens = cu_seqlens if cached is None else cached.cu_seqlens_split_flat
+    num_summaries = 1 if cached is None else cached.S_split_total
 
     dhm = intracard_pre_scan_bwd(
         q=q,
@@ -965,17 +1108,18 @@ def prepare_intracard_bwd_affine_summary(
         g=g,
         gk=gk,
         scale=scale,
-        cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-        S_split=cached.S_split_total,
+        cu_seqlens_subseq_split=split_cu_seqlens,
+        S_split=num_summaries,
         chunk_size=chunk_size,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
     )
-    rank_dhm = compose_affine_summaries(
-        dhm,
+    return IntraCardAffineSummary(
+        cache=cached,
+        per_split=dhm,
+        per_rank=dhm[0] if num_summaries == 1 else None,
         forward=False,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
     )
-    return IntraCardAffineSummary(cache=cached, per_split=dhm, per_rank=rank_dhm, forward=False)
 
 
 def intracard_fwd_h(
@@ -1024,13 +1168,18 @@ def intracard_fwd_h(
             device=device,
         )
     if cached is None:
+        prepared_initial_state = (
+            intra_affine_summary.boundary_states
+            if intra_affine_summary is not None and intra_affine_summary.boundary_states is not None
+            else initial_state
+        )
         result = _raw_chunk_gated_delta_rule_fwd_h(
             k=k,
             w=w,
             u=u,
             g=g,
             gk=gk,
-            initial_state=initial_state,
+            initial_state=prepared_initial_state,
             output_final_state=output_final_state,
             chunk_size=chunk_size,
             save_new_value=save_new_value,
@@ -1038,14 +1187,18 @@ def intracard_fwd_h(
             chunk_indices=chunk_indices,
             state_v_first=state_v_first,
         )
-        return (*result, None) if return_intra_initial_state else result
+        return (*result, prepared_initial_state) if return_intra_initial_state else result
 
     if state_v_first:
         state_shape = (cached.total_subseqs, HV, V, K)
     else:
         state_shape = (cached.total_subseqs, HV, K, V)
 
-    if intra_initial_state is None:
+    prepared_initial_state = intra_initial_state
+    if prepared_initial_state is None and intra_affine_summary is not None:
+        prepared_initial_state = intra_affine_summary.boundary_states
+
+    if prepared_initial_state is None:
         if intra_affine_summary is not None:
             hm = intra_affine_summary.per_split
         else:
@@ -1084,16 +1237,17 @@ def intracard_fwd_h(
         if initial_states_merge is not None and num_non_first > 0:
             initial_state_expanded[cached.non_first_indices_gpu] = initial_states_merge
     else:
-        # backward recomputation can reuse the fp32 split states produced by forward
-        if intra_initial_state.shape != state_shape:
+        if prepared_initial_state.shape != state_shape:
             raise ValueError(
-                f"intra_initial_state must have shape {state_shape}, got {tuple(intra_initial_state.shape)}"
+                f"intra_initial_state must have shape {state_shape}, got {tuple(prepared_initial_state.shape)}"
             )
-        if intra_initial_state.dtype != torch.float32:
-            raise ValueError(f"intra_initial_state must have dtype torch.float32, got {intra_initial_state.dtype}")
-        if intra_initial_state.device != device:
-            raise ValueError(f"intra_initial_state must be on {device}, got {intra_initial_state.device}")
-        initial_state_expanded = intra_initial_state
+        if prepared_initial_state.dtype != torch.float32:
+            raise ValueError(
+                f"intra_initial_state must have dtype torch.float32, got {prepared_initial_state.dtype}"
+            )
+        if prepared_initial_state.device != device:
+            raise ValueError(f"intra_initial_state must be on {device}, got {prepared_initial_state.device}")
+        initial_state_expanded = prepared_initial_state
 
     h, v_new, final_state_subseq = _raw_chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -1162,6 +1316,11 @@ def intracard_bwd_dhu(
             device=q.device,
         )
     if cached is None:
+        prepared_dht = (
+            intra_affine_summary.boundary_states
+            if intra_affine_summary is not None and intra_affine_summary.boundary_states is not None
+            else dht
+        )
         return _raw_chunk_gated_delta_rule_bwd_dhu(
             q=q,
             k=k,
@@ -1171,7 +1330,7 @@ def intracard_bwd_dhu(
             g=g,
             gk=gk,
             h0=h0,
-            dht=dht,
+            dht=prepared_dht,
             scale=scale,
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
@@ -1180,48 +1339,55 @@ def intracard_bwd_dhu(
             chunk_offsets=chunk_offsets,
         )
 
-    if intra_affine_summary is not None:
-        dhm = intra_affine_summary.per_split
-    else:
-        dhm = intracard_pre_scan_bwd(
-            q=q,
-            k=k,
-            w=w,
-            do=do,
-            dv=dv,
-            g=g,
-            gk=gk,
-            scale=scale,
-            cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
-            S_split=cached.S_split_total,
-            chunk_size=chunk_size,
-            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        )
-    dht_merge, num_non_first = intracard_merge(
-        hm=dhm,
-        split_info=cached.split_info,
-        num_non_first=cached.num_non_first,
-        merge_seq_offsets=cached.merge_seq_offsets,
-        merge_init_offsets=cached.merge_init_offsets,
-        device=q.device,
-        initial_state=dht,
-        state_v_first=state_v_first,
-        use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        forward=False,
-        seq_offsets=cached.merge_seq_offsets_gpu,
-        init_offsets=cached.merge_init_offsets_gpu,
-        h0_seq_ids=cached.split_seq_ids_gpu,
-    )
-
     if state_v_first:
         state_shape = (cached.total_subseqs, HV, V, K)
     else:
         state_shape = (cached.total_subseqs, HV, K, V)
-    dht_expanded = q.new_zeros(state_shape, dtype=torch.float32)
-    if dht is not None:
-        dht_expanded[cached.last_subseq_indices_gpu] = dht
-    if dht_merge is not None and num_non_first > 0:
-        dht_expanded[cached.non_last_indices_gpu] = dht_merge
+    prepared_dht = intra_affine_summary.boundary_states if intra_affine_summary is not None else None
+    if prepared_dht is not None:
+        if prepared_dht.shape != state_shape:
+            raise ValueError(f"intra dht must have shape {state_shape}, got {tuple(prepared_dht.shape)}")
+        if prepared_dht.dtype != torch.float32 or prepared_dht.device != q.device:
+            raise ValueError("intra dht must be an fp32 tensor on the same device as q")
+        dht_expanded = prepared_dht
+    else:
+        if intra_affine_summary is not None:
+            dhm = intra_affine_summary.per_split
+        else:
+            dhm = intracard_pre_scan_bwd(
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                gk=gk,
+                scale=scale,
+                cu_seqlens_subseq_split=cached.cu_seqlens_split_flat,
+                S_split=cached.S_split_total,
+                chunk_size=chunk_size,
+                use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+            )
+        dht_merge, num_non_first = intracard_merge(
+            hm=dhm,
+            split_info=cached.split_info,
+            num_non_first=cached.num_non_first,
+            merge_seq_offsets=cached.merge_seq_offsets,
+            merge_init_offsets=cached.merge_init_offsets,
+            device=q.device,
+            initial_state=dht,
+            state_v_first=state_v_first,
+            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+            forward=False,
+            seq_offsets=cached.merge_seq_offsets_gpu,
+            init_offsets=cached.merge_init_offsets_gpu,
+            h0_seq_ids=cached.split_seq_ids_gpu,
+        )
+        dht_expanded = q.new_zeros(state_shape, dtype=torch.float32)
+        if dht is not None:
+            dht_expanded[cached.last_subseq_indices_gpu] = dht
+        if dht_merge is not None and num_non_first > 0:
+            dht_expanded[cached.non_last_indices_gpu] = dht_merge
 
     h0_expanded = q.new_empty(state_shape, dtype=torch.float32) if h0 is not None else None
     dh, dh0_subseq, dv2 = _raw_chunk_gated_delta_rule_bwd_dhu(

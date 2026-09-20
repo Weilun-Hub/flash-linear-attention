@@ -87,6 +87,8 @@ def chunk_kda_fwd(
     )
 
     intra_affine_summary = None
+    flat_boundary_states = None
+    cp_world_size = None
     if (
         cp_context is not None
         and cp_context.group is not None
@@ -103,8 +105,31 @@ def chunk_kda_fwd(
             cu_seqlens_cpu=cu_seqlens_cpu,
             chunk_size=chunk_size,
         )
+        cp_world_size = torch.distributed.get_world_size(group=cp_context.group)
+        if intra_affine_summary is not None:
+            from fla.ops.common.intracard_cp import (
+                materialize_rank_affine_summary,
+                merge_flat_affine_summaries,
+            )
+            use_flat_merge = (
+                cp_context.num_seqs == 1
+                and cp_context.pre_num_ranks + cp_context.post_num_ranks + 1 == cp_world_size
+            )
+            if use_flat_merge:
+                flat_boundary_states = merge_flat_affine_summaries(
+                    intra_affine_summary,
+                    group=cp_context.group,
+                    state_v_first=state_v_first,
+                    use_tf32x3_affine_chain=cp_context.use_tf32x3_affine_chain,
+                )
+            if flat_boundary_states is None:
+                if cp_world_size != 1:
+                    intra_affine_summary = materialize_rank_affine_summary(intra_affine_summary)
+            else:
+                intra_affine_summary = intra_affine_summary._replace(boundary_states=flat_boundary_states)
+                initial_state = flat_boundary_states[:1]
 
-    if cp_context is not None:
+    if cp_context is not None and flat_boundary_states is None and cp_world_size != 1:
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
             k=kg,
             w=w,
