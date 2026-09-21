@@ -52,10 +52,10 @@ else:
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
-    key=['T', 'H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    key=['T', 'N', 'H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'N'])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
     v,
@@ -69,6 +69,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     cu_seqlens,
     chunk_offsets,
     T,
+    N,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -363,10 +364,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
-    key=['T', 'H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
+    key=['T', 'N', 'H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'N'])
 def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     q,
     k,
@@ -383,6 +384,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     chunk_offsets,
     scale,
     T,
+    N,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -778,6 +780,7 @@ def chunk_gated_delta_rule_fwd_h(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        N=N,
         H=H,
         HV=HV,
         K=K,
@@ -856,6 +859,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         chunk_offsets=chunk_offsets,
         scale=scale,
         T=T,
+        N=N,
         H=H,
         HV=HV,
         K=K,
