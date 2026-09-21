@@ -536,7 +536,17 @@ def compose_affine_summaries(
         for num_warps in [2, 4]
         for num_stages in [2, 3]
     ],
-    key=['HV', 'K', 'V', 'NUM_GLOBAL_SUMMARIES', 'FORWARD'],
+    key=[
+        'HV',
+        'K',
+        'V',
+        'NUM_LOCAL_SUMMARIES',
+        'NUM_GLOBAL_SUMMARIES',
+        'NUM_STEPS',
+        'FORWARD',
+        'STATE_V_FIRST',
+        'AFFINE_CHAIN_PRECISION',
+    ],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -550,6 +560,7 @@ def merge_flat_affine_summaries_kernel(
     BV: tl.constexpr,
     NUM_LOCAL_SUMMARIES: tl.constexpr,
     NUM_GLOBAL_SUMMARIES: tl.constexpr,
+    NUM_STEPS: tl.constexpr,
     RANK: tl.constexpr,
     FORWARD: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
@@ -567,7 +578,10 @@ def merge_flat_affine_summaries_kernel(
     local_start = RANK * NUM_LOCAL_SUMMARIES
     local_end = local_start + NUM_LOCAL_SUMMARIES
 
-    for step in range(NUM_GLOBAL_SUMMARIES):
+    # A rank only needs the prefix/suffix that reaches its local summaries.
+    # Stop after producing the last local boundary instead of evaluating the
+    # remainder of the global affine chain.
+    for step in range(NUM_STEPS):
         i_s = step if FORWARD else NUM_GLOBAL_SUMMARIES - 1 - step
         if i_s >= local_start:
             if i_s < local_end:
@@ -579,7 +593,7 @@ def merge_flat_affine_summaries_kernel(
                     p_out = boundary_states + (i_local * HV + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
                     tl.store(p_out, b_h, mask=m_k[:, None] & m_v[None, :])
 
-        if step < NUM_GLOBAL_SUMMARIES - 1:
+        if step < NUM_STEPS - 1:
             base = i_s * stride_s + i_h * stride_h
             p_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
             b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
@@ -616,6 +630,9 @@ def merge_flat_affine_summaries(
         boundary_states = hm.new_empty(num_local_summaries, HV, K, V)
     BK = triton.next_power_of_2(K)
     rank = dist.get_rank(group=group)
+    local_start = rank * num_local_summaries
+    local_end = local_start + num_local_summaries
+    num_steps = local_end if summary.forward else num_global_summaries - local_start
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), HV)
@@ -629,6 +646,7 @@ def merge_flat_affine_summaries(
         BK=BK,
         NUM_LOCAL_SUMMARIES=num_local_summaries,
         NUM_GLOBAL_SUMMARIES=num_global_summaries,
+        NUM_STEPS=num_steps,
         RANK=rank,
         FORWARD=summary.forward,
         STATE_V_FIRST=state_v_first,
