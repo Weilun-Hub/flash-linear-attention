@@ -15,13 +15,10 @@ Usage:
     # CP8 configuration, 256k forward only
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 262144 --forward-only
 
-    # CP8 configuration, 256k backward without the memory-heavy All2All comparison
-    torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 262144 --backward --skip-all2all
-
     # CP8 with baseline comparison (test local 32k and scale to 128k)
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 131072 --backward --with-baseline
 
-    # CP8 with detailed kernel profiling (all ranks participate; rank 0 reports)
+    # CP8 with detailed per-rank kernel profiling
     torchrun --nproc_per_node=8 benchmark_kda_cp8_vs_cp2tp.py --config cp8 --seqlen 131072 --forward-only --profile-kernels
 
     # CP2TP configuration
@@ -34,10 +31,6 @@ import random
 
 import torch
 import torch.distributed as dist
-from torch.distributed.nn.functional import (
-    all_gather as autograd_all_gather,
-    all_reduce as autograd_all_reduce,
-)
 
 from fla.ops.cp import build_cp_context
 from fla.ops.kda import chunk_kda
@@ -59,12 +52,8 @@ def get_args():
     parser.add_argument("--backward", action="store_true", help="Enable backward pass (default: forward only)")
     parser.add_argument("--forward-only", action="store_true", help="Only run forward pass")
     parser.add_argument("--with-baseline", action="store_true", help="Also test single-GPU baseline (local seqlen / cp_size)")
-    parser.add_argument("--skip-all2all", action="store_true", help="Skip the memory-heavy All2All CP comparison")
-    parser.add_argument(
-        "--profile-kernels",
-        action="store_true",
-        help="Profile individual kernels on all ranks and report rank 0",
-    )
+    parser.add_argument("--profile-kernels", action="store_true", help="Profile individual kernels on every rank")
+    parser.add_argument("--skip-all2all", action="store_true", help="Skip the All2All baseline benchmark")
     parser.add_argument("--bench", action="store_true", default=True, help="Run benchmark")
     parser.add_argument("--steps", type=int, default=20, help="Benchmark steps")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup steps")
@@ -82,61 +71,47 @@ def print_rank0(*args, **kwargs):
 
 
 def all_gather(x, group=None) -> torch.Tensor:
-    """Differentiable all-gather concatenated along the leading dimension."""
-    return torch.cat(autograd_all_gather(x, group=group), dim=0)
+    world_size = dist.get_world_size(group=group)
+    y = torch.empty(world_size * x.size(0), *x.shape[1:], device=x.device, dtype=x.dtype)
+    dist.all_gather_into_tensor(y, x, group=group)
+    return y
 
 
 def bench(fn, step=20, warm_up=10, grad_to_none=None):
-    """Benchmark function with CUDA events.
-
-    Clear leaf gradients after every iteration so each measured backward
-    starts from grad=None instead of accumulating into an existing .grad.
-    """
+    """Benchmark function with CUDA events."""
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     # Warmup
-    for _ in range(warm_up):
+    for i in range(warm_up):
         fn()
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-
-    # Make sure warmup work is finished before timing.
-    torch.cuda.synchronize()
 
     # Benchmark
+    torch.cuda.synchronize()
     start_event.record()
-    for _ in range(step):
+    for i in range(step):
         fn()
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
     end_event.record()
-
     torch.cuda.synchronize()
 
     elapsed_time = start_event.elapsed_time(end_event)
     return elapsed_time / step
 
 
-def profile_kernels(fn, rank, steps=5, warmup=2, grad_to_none=None):
-    """Profile individual kernels using PyTorch profiler.
+def profile_kernels(fn, steps=5, warmup=2):
+    """Profile individual kernels using PyTorch profiler."""
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
-    Clear leaf gradients after every iteration so profiler results do not
-    include aten::add_ kernels caused by cross-iteration grad accumulation.
-    """
     # Warmup
     for _ in range(warmup):
         fn()
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-
-    # Ensure warmup kernels are complete before profiling.
-    torch.cuda.synchronize()
 
     # Profile
+    profile_step_times = []
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -148,29 +123,60 @@ def profile_kernels(fn, rank, steps=5, warmup=2, grad_to_none=None):
         profile_memory=False,
         acc_events=True,
     ) as prof:
-        for _ in range(steps + 1):
+        for profile_step in range(steps + 1):
             torch.cuda.synchronize()
+            if profile_step > 0:
+                start_event.record()
             fn()
-            if grad_to_none is not None:
-                for x in grad_to_none:
-                    x.grad = None
+            if profile_step > 0:
+                end_event.record()
             torch.cuda.synchronize()
+            if profile_step > 0:
+                profile_step_times.append(start_event.elapsed_time(end_event))
             prof.step()
 
     # Get kernel stats
     kernel_stats = []
     for event in prof.key_averages():
-        device_time_total = event.device_time_total
-        if device_time_total > 0:  # Only device kernels
+        device_time_total = getattr(event, 'device_time_total', None)
+        if device_time_total is None:
+            device_time_total = event.cuda_time_total
+        if device_time_total > 0:
             kernel_stats.append({
                 'name': event.key,
-                'cuda_time_ms': device_time_total / 1000,  # Convert to ms
+                'cuda_time_ms': device_time_total / 1000,
                 'calls': event.count,
             })
 
     # Sort by time
     kernel_stats.sort(key=lambda x: x['cuda_time_ms'], reverse=True)
-    return kernel_stats
+    return kernel_stats, sum(profile_step_times) / len(profile_step_times)
+
+
+def gather_rank_times(elapsed_ms, device):
+    """Gather one elapsed time from every distributed rank."""
+    local_time = torch.tensor([elapsed_ms], device=device, dtype=torch.float64)
+    rank_times = torch.empty(dist.get_world_size(), device=device, dtype=torch.float64)
+    dist.all_gather_into_tensor(rank_times, local_time)
+    return rank_times.cpu().tolist()
+
+
+def format_rank_time_table(label, rank_times, tp_size):
+    """Format per-rank timings and their distributed summary."""
+    slowest_rank = max(range(len(rank_times)), key=rank_times.__getitem__)
+    mean_time = sum(rank_times) / len(rank_times)
+
+    lines = [f"{label} per-rank time (ms):"]
+    lines.append(f"{'Rank':<6} {'CP Rank':<9} {'TP Rank':<9} {'Time (ms)':<12}")
+    lines.append("-" * 40)
+    for rank, elapsed_ms in enumerate(rank_times):
+        lines.append(f"{rank:<6} {rank // tp_size:<9} {rank % tp_size:<9} {elapsed_ms:<12.3f}")
+    lines.append("-" * 40)
+    lines.append(
+        f"min/mean/max: {min(rank_times):.3f} / {mean_time:.3f} / {max(rank_times):.3f} ms; "
+        f"slowest rank: {slowest_rank} (CP {slowest_rank // tp_size}, TP {slowest_rank % tp_size})"
+    )
+    return "\n".join(lines)
 
 
 def format_kernel_table(kernel_stats, top_n=20):
@@ -218,21 +224,18 @@ def run_benchmark(args):
     cp_rank = rank // tp_size
     tp_rank = rank % tp_size
 
-    # All ranks must create every subgroup in the same global order.
-    # CP groups contain ranks sharing a TP rank and communicate along sequence.
     cp_group = None
-    for tp_idx in range(tp_size):
-        ranks = list(range(tp_idx, world_size, tp_size))
-        group = dist.new_group(ranks)
-        if rank in ranks:
+    for group_tp_rank in range(tp_size):
+        cp_ranks = list(range(group_tp_rank, world_size, tp_size))
+        group = dist.new_group(cp_ranks)
+        if group_tp_rank == tp_rank:
             cp_group = group
 
-    # TP groups contain ranks sharing a CP rank and communicate along heads.
     tp_group = None
-    for cp_idx in range(cp_size):
-        ranks = list(range(cp_idx * tp_size, (cp_idx + 1) * tp_size))
-        group = dist.new_group(ranks)
-        if rank in ranks:
+    for group_cp_rank in range(cp_size):
+        tp_ranks = list(range(group_cp_rank * tp_size, (group_cp_rank + 1) * tp_size))
+        group = dist.new_group(tp_ranks)
+        if group_cp_rank == cp_rank:
             tp_group = group
 
     assert cp_group is not None
@@ -278,7 +281,7 @@ def run_benchmark(args):
     if test_baseline:
         print_rank0(f"Baseline: Single-GPU {T_baseline} (scale to {T_total})")
     if profile_kernels_flag:
-        print_rank0("Kernel Profiling: Enabled (all ranks, reporting rank 0)")
+        print_rank0("Kernel Profiling: Enabled (all ranks)")
     print_rank0(f"{'='*60}\n")
 
     # No varlen for simplicity - fixed length sequences
@@ -345,11 +348,7 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            o = autograd_all_reduce(
-                o,
-                op=dist.ReduceOp.SUM,
-                group=tp_group,
-            )
+            dist.all_reduce(o, group=tp_group)
 
         dist.barrier()
         if run_backward:
@@ -386,12 +385,8 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            o_full = autograd_all_reduce(
-                o_full,
-                op=dist.ReduceOp.SUM,
-                group=tp_group,
-            )
-        
+            dist.all_reduce(o_full, group=tp_group)
+
         dist.barrier()
         if run_backward:
             if cp_size > 1:
@@ -432,23 +427,22 @@ def run_benchmark(args):
     # Warmup CUDA
     torch.cuda.synchronize()
 
-    # All ranks run the workload because it contains distributed collectives.
+    # run kernel profiling on every rank because the measured function contains distributed collectives
     if profile_kernels_flag:
+        dist.barrier()
+        kernel_stats, profile_step_time = profile_kernels(kda_with_cp, steps=5, warmup=2)
+        profile_step_times = gather_rank_times(profile_step_time, device)
+        kernel_stats_by_rank = [None] * world_size
+        dist.all_gather_object(kernel_stats_by_rank, kernel_stats)
+
         if rank == 0:
             print(f"\n{'='*60}")
-            print("Profiling CP kernels (all ranks, reporting rank 0)")
+            print("Profiling CP kernels (all ranks)")
             print(f"{'='*60}\n")
-
-        kernel_stats = profile_kernels(
-            kda_with_cp,
-            rank,
-            steps=5,
-            warmup=2,
-            grad_to_none=[q, k, v, g, beta] if run_backward else None,
-        )
-
-        if rank == 0:
-            print(format_kernel_table(kernel_stats, top_n=50))
+            print(format_rank_time_table("Profiler step", profile_step_times, tp_size))
+            for profile_rank, stats in enumerate(kernel_stats_by_rank):
+                print(f"\nRank {profile_rank} kernel profile:")
+                print(format_kernel_table(stats, top_n=20))
             print()
 
     # Run benchmarks
@@ -464,23 +458,24 @@ def run_benchmark(args):
         t_cp = bench(kda_with_cp, step=args.steps, warm_up=args.warmup,
                      grad_to_none=[q, k, v, g, beta] if run_backward else None)
         dist.barrier()
+        t_cp_by_rank = gather_rank_times(t_cp, device)
 
-        # Benchmark All2All CP (all-gather approach)
-        t_all2all_cp = None
         if not args.skip_all2all:
+            # benchmark All2All CP using the all-gather approach
             dist.barrier()
             t_all2all_cp = bench(kda_with_all2all_cp, step=args.steps, warm_up=args.warmup,
                                  grad_to_none=[q, k, v, g, beta] if run_backward else None)
             dist.barrier()
+            t_all2all_cp_by_rank = gather_rank_times(t_all2all_cp, device)
 
         # Benchmark baseline (single GPU)
         if test_baseline:
             dist.barrier()
             t_baseline_local = bench(kda_baseline_single_gpu, step=args.steps, warm_up=args.warmup,
                                      grad_to_none=[q_base, k_base, v_base, g_base, beta_base] if run_backward else None)
-            # Scale to total sequence length (theoretical time on single GPU)
-            t_baseline_scaled = t_baseline_local * cp_size
             dist.barrier()
+            t_baseline_local_by_rank = gather_rank_times(t_baseline_local, device)
+            t_baseline_scaled_by_rank = [elapsed_ms * cp_size for elapsed_ms in t_baseline_local_by_rank]
 
         # Print results
         if rank == 0:
@@ -489,31 +484,33 @@ def run_benchmark(args):
             print(f"SeqLen: {T_total}, Heads: {H}, HeadDim: {K}")
             print(f"Mode: {'Forward + Backward' if run_backward else 'Forward Only'}")
             print(f"{'='*60}")
-            print(f"CP time:                {t_cp:.3f} ms")
-            if t_all2all_cp is not None:
-                print(f"All2All CP time:        {t_all2all_cp:.3f} ms")
-                print(f"Speedup (vs All2All):   {t_all2all_cp / t_cp:.2f}x")
-            else:
+            print(format_rank_time_table("CP", t_cp_by_rank, tp_size))
+            t_cp_max = max(t_cp_by_rank)
+            print(f"CP time:                {t_cp_max:.3f} ms (max across ranks)")
+            if args.skip_all2all:
                 print("All2All CP time:        skipped")
+            else:
+                print()
+                print(format_rank_time_table("All2All CP", t_all2all_cp_by_rank, tp_size))
+                t_all2all_cp_max = max(t_all2all_cp_by_rank)
+                print(f"All2All CP time:        {t_all2all_cp_max:.3f} ms (max across ranks)")
+                print(f"Speedup (vs All2All):   {t_all2all_cp_max / t_cp_max:.2f}x")
             if test_baseline:
                 print(f"{'='*60}")
                 print("Single-GPU Baseline:")
-                print(f"  Local {T_baseline}:           {t_baseline_local:.3f} ms")
-                print(f"  Scaled to {T_total}:      {t_baseline_scaled:.3f} ms (est.)")
-                print(f"Speedup (vs Scaled):    {t_baseline_scaled / t_cp:.2f}x")
+                print(format_rank_time_table(f"Local {T_baseline}", t_baseline_local_by_rank, tp_size))
+                t_baseline_scaled_max = max(t_baseline_scaled_by_rank)
+                print(f"  Scaled to {T_total}:      {t_baseline_scaled_max:.3f} ms (est., max across ranks)")
+                print(f"Speedup (vs Scaled):    {t_baseline_scaled_max / t_cp_max:.2f}x")
             print(f"{'='*60}\n")
 
 
 def main():
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-
-    dist.init_process_group(
-        device_id=torch.device("cuda", local_rank),
-    )
-
-    rank = dist.get_rank()
+    dist.init_process_group(device_id=torch.device("cuda", local_rank))
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
 
     torch.manual_seed(rank + 42)
     torch.cuda.manual_seed(rank + 42)
