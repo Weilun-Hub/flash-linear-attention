@@ -52,7 +52,7 @@ else:
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    key=['T', 'H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -363,7 +363,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
+    key=['T', 'H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
