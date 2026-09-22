@@ -161,6 +161,32 @@ def test_intracard_backend_enabled_when_env_var_is_one(monkeypatch):
     assert IntraCardCPBackend.is_enabled() is True
 
 
+def test_intracard_affine_summary_keeps_fp32_local_copy_for_bf16_communication(monkeypatch):
+    B, T, H, HV, K, V = 1, 64, 1, 2, 32, 48
+    k = torch.empty(B, T, H, K)
+    w = torch.empty(B, T, HV, K)
+    u = torch.empty(B, T, HV, V)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32)
+    hm = torch.randn(1, HV, K, V + K, dtype=torch.float32)
+
+    monkeypatch.setattr(intracard_cp_mod, "_prepare_intracard_cache_entry", lambda **kwargs: None)
+    monkeypatch.setattr(intracard_cp_mod, "intracard_pre_scan", lambda **kwargs: hm)
+
+    summary = intracard_cp_mod.prepare_intracard_fwd_affine_summary(
+        k=k,
+        w=w,
+        u=u,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens,
+        use_bf16_affine_comm=True,
+    )
+
+    assert summary is not None
+    assert summary.per_split is hm
+    assert summary.per_split.dtype == torch.float32
+    assert summary.use_bf16_affine_comm is True
+
+
 def test_intracard_backend_verifiers():
     from fla.ops.common.backends.intracard import IntraCardCPBackend
 

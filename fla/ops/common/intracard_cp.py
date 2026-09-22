@@ -89,6 +89,7 @@ class IntraCardAffineSummary(NamedTuple):
     per_rank: torch.Tensor | None
     forward: bool
     use_tf32x3_affine_chain: bool
+    use_bf16_affine_comm: bool
     boundary_states: torch.Tensor | None = None
 
 
@@ -536,12 +537,13 @@ def compose_affine_summaries(
         for num_warps in [2, 4]
         for num_stages in [2, 3]
     ],
-    key=['HV', 'K', 'V', 'NUM_GLOBAL_SUMMARIES', 'FORWARD'],
+    key=['HV', 'K', 'V', 'NUM_GLOBAL_SUMMARIES', 'FORWARD', 'USE_BF16_AFFINE_COMM'],
     **autotune_cache_kwargs,
 )
 @triton.jit
 def merge_flat_affine_summaries_kernel(
     boundary_states,
+    hm,
     ag_hm,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -552,6 +554,7 @@ def merge_flat_affine_summaries_kernel(
     NUM_GLOBAL_SUMMARIES: tl.constexpr,
     RANK: tl.constexpr,
     FORWARD: tl.constexpr,
+    USE_BF16_AFFINE_COMM: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     AFFINE_CHAIN_PRECISION: tl.constexpr,
 ):
@@ -580,11 +583,56 @@ def merge_flat_affine_summaries_kernel(
                     tl.store(p_out, b_h, mask=m_k[:, None] & m_v[None, :])
 
         if step < NUM_GLOBAL_SUMMARIES - 1:
-            base = i_s * stride_s + i_h * stride_h
-            p_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
-            b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
-            p_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
-            b_m = tl.load(p_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            if USE_BF16_AFFINE_COMM:
+                if i_s >= local_start:
+                    if i_s < local_end:
+                        local_base = (i_s - local_start) * stride_s + i_h * stride_h
+                        p_local_he = hm + local_base + o_k[:, None] * (V + K) + o_v[None, :]
+                        b_he = tl.load(
+                            p_local_he,
+                            mask=m_k[:, None] & m_v[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        p_local_m = hm + local_base + V + o_k[:, None] * (V + K) + o_k[None, :]
+                        b_m = tl.load(
+                            p_local_m,
+                            mask=m_k[:, None] & m_k[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                    else:
+                        base = i_s * stride_s + i_h * stride_h
+                        p_remote_after_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+                        b_he = tl.load(
+                            p_remote_after_he,
+                            mask=m_k[:, None] & m_v[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        p_remote_after_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+                        b_m = tl.load(
+                            p_remote_after_m,
+                            mask=m_k[:, None] & m_k[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                else:
+                    base = i_s * stride_s + i_h * stride_h
+                    p_remote_before_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+                    b_he = tl.load(
+                        p_remote_before_he,
+                        mask=m_k[:, None] & m_v[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    p_remote_before_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+                    b_m = tl.load(
+                        p_remote_before_m,
+                        mask=m_k[:, None] & m_k[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+            else:
+                base = i_s * stride_s + i_h * stride_h
+                p_fp32_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+                b_he = tl.load(p_fp32_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+                p_fp32_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+                b_m = tl.load(p_fp32_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
             b_h = tl.dot(b_m, b_h, input_precision=AFFINE_CHAIN_PRECISION) + b_he
 
 
@@ -607,7 +655,8 @@ def merge_flat_affine_summaries(
     if world_size == 1:
         ag_hm = hm
     else:
-        gathered_hm, _ = all_gather_into_tensor(hm, group=group)
+        wire_hm = hm.to(torch.bfloat16) if summary.use_bf16_affine_comm else hm
+        gathered_hm, _ = all_gather_into_tensor(wire_hm, group=group)
         ag_hm = gathered_hm.flatten(0, 1)
 
     if state_v_first:
@@ -622,6 +671,7 @@ def merge_flat_affine_summaries(
 
     merge_flat_affine_summaries_kernel[grid](
         boundary_states=boundary_states,
+        hm=hm,
         ag_hm=ag_hm,
         HV=HV,
         K=K,
@@ -631,6 +681,7 @@ def merge_flat_affine_summaries(
         NUM_GLOBAL_SUMMARIES=num_global_summaries,
         RANK=rank,
         FORWARD=summary.forward,
+        USE_BF16_AFFINE_COMM=summary.use_bf16_affine_comm and world_size != 1,
         STATE_V_FIRST=state_v_first,
         AFFINE_CHAIN_PRECISION=(
             "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
@@ -1027,6 +1078,7 @@ def prepare_intracard_fwd_affine_summary(
     chunk_size: int = 64,
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
+    use_bf16_affine_comm: bool = False,
 ) -> IntraCardAffineSummary | None:
     """Prepare per-split summaries once for a single contiguous CP sequence."""
     K = k.shape[-1]
@@ -1064,6 +1116,7 @@ def prepare_intracard_fwd_affine_summary(
         per_rank=hm[0] if num_summaries == 1 else None,
         forward=True,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        use_bf16_affine_comm=use_bf16_affine_comm,
     )
 
 
@@ -1081,6 +1134,7 @@ def prepare_intracard_bwd_affine_summary(
     chunk_size: int = 64,
     max_splits: int = 32,
     use_tf32x3_affine_chain: bool = False,
+    use_bf16_affine_comm: bool = False,
 ) -> IntraCardAffineSummary | None:
     """Prepare per-split backward summaries once for CP and the local reverse scan."""
     K = q.shape[-1]
@@ -1121,6 +1175,7 @@ def prepare_intracard_bwd_affine_summary(
         per_rank=dhm[0] if num_summaries == 1 else None,
         forward=False,
         use_tf32x3_affine_chain=use_tf32x3_affine_chain,
+        use_bf16_affine_comm=use_bf16_affine_comm,
     )
 
 

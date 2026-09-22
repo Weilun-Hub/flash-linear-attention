@@ -30,6 +30,9 @@ MAX_SUBSEQS = int(os.environ.get('FLA_INTRACARD_MAX_SPLITS', 32))
 # use tf32x3 for the affine-chain dots in the pre-scan/merge kernels (NVIDIA only)
 USE_TF32X3_AFFINE_CHAIN = os.environ.get('FLA_INTRACARD_TF32X3', '0') == '1'
 
+# communicate affine summaries in bf16 while retaining fp32 local summaries and accumulation
+USE_BF16_AFFINE_COMM = os.environ.get('FLA_INTRACARD_BF16_COMM', '0') == '1'
+
 MAX_INTRACARD_HEAD_DIM = 256
 
 if USE_TF32X3_AFFINE_CHAIN and not IS_TF32_SUPPORTED:
@@ -75,6 +78,7 @@ class IntraCardCPBackend(BaseBackend):
             chunk_size=chunk_size,
             max_splits=MAX_SUBSEQS,
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+            use_bf16_affine_comm=USE_BF16_AFFINE_COMM,
         )
 
     def prepare_chunk_gated_delta_rule_bwd_dhu_affine(
@@ -107,6 +111,7 @@ class IntraCardCPBackend(BaseBackend):
             chunk_size=chunk_size,
             max_splits=MAX_SUBSEQS,
             use_tf32x3_affine_chain=USE_TF32X3_AFFINE_CHAIN,
+            use_bf16_affine_comm=USE_BF16_AFFINE_COMM,
         )
 
     def chunk_gated_delta_rule_fwd_h_verifier(
