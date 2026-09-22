@@ -298,6 +298,43 @@ def test_compose_affine_summaries(forward: bool):
 
 
 @pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
+def test_compose_affine_pair():
+    torch.manual_seed(42)
+    HV, K, V = 2, 32, 48
+
+    def make_summary():
+        summary = torch.empty(HV, K, V + K, device=device, dtype=torch.float32)
+        summary[..., :V] = torch.randn(HV, K, V, device=device, dtype=torch.float32) * 0.01
+        identity = torch.eye(K, device=device, dtype=torch.float32).view(1, K, K)
+        summary[..., V:] = identity + torch.randn(HV, K, K, device=device, dtype=torch.float32) * 0.001
+        return summary
+
+    earlier = make_summary()
+    later = make_summary()
+    old_allow_tf32 = None
+    if device_platform == "cuda":
+        old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        expected = torch.cat(
+            (
+                later[..., V:] @ earlier[..., :V] + later[..., :V],
+                later[..., V:] @ earlier[..., V:],
+            ),
+            dim=-1,
+        )
+    finally:
+        if old_allow_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+    actual = intracard_cp_mod.compose_affine_pair(
+        earlier,
+        later,
+        use_tf32x3_affine_chain=False,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(device_platform not in ("cuda", "hip"), reason="requires a CUDA or ROCm GPU")
 @pytest.mark.parametrize(
     ("forward", "state_v_first"),
     [

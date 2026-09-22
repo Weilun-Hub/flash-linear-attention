@@ -590,6 +590,7 @@ def chunk_kda_bwd(
             use_flat_merge = (
                 cp_context.num_seqs == 1
                 and cp_context.pre_num_ranks + cp_context.post_num_ranks + 1 == cp_world_size
+                and dht is None
             )
             if use_flat_merge:
                 flat_boundary_states = merge_flat_affine_summaries(
