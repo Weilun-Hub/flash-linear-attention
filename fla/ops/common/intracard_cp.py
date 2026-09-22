@@ -30,6 +30,7 @@ from fla.ops.common.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
 from fla.ops.cp.chunk_delta_h import pre_process_bwd_kernel_merged, pre_process_fwd_kernel_merged
+from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
 from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs, get_multiprocessor_count
 
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Key: object identity and contents of cu_seqlens plus split configuration
 _intracard_cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
 _INTRACARD_CACHE_MAXSIZE = 32
+_FLAT_AFFINE_MAX_SUMMARIES = 32
 
 
 class _CacheEntry(NamedTuple):
@@ -529,179 +531,27 @@ def compose_affine_summaries(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BC': BC}, num_warps=num_warps, num_stages=num_stages)
-        for BC in [32, 64]
-        for num_warps in [4, 8]
-        for num_stages in [1, 2]
-    ],
-    key=['HV', 'K', 'V', 'AFFINE_CHAIN_PRECISION'],
-    **autotune_cache_kwargs,
-)
-@triton.jit
-def compose_affine_pair_kernel(
-    earlier,
-    later,
-    output,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BC: tl.constexpr,
-    AFFINE_CHAIN_PRECISION: tl.constexpr,
-):
-    """Compose two affine maps as ``later(earlier(h))``."""
-    i_c = tl.program_id(0).to(tl.int64)
-    i_h = tl.program_id(1).to(tl.int64)
-    o_k = tl.arange(0, BK)
-    o_c = i_c * BC + tl.arange(0, BC)
-    m_k = o_k < K
-    m_c = o_c < V + K
-    stride_h = K * (V + K)
-
-    p_later_m = later + i_h * stride_h + V + o_k[:, None] * (V + K) + o_k[None, :]
-    b_later_m = tl.load(p_later_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-    p_earlier = earlier + i_h * stride_h + o_k[:, None] * (V + K) + o_c[None, :]
-    b_earlier = tl.load(p_earlier, mask=m_k[:, None] & m_c[None, :], other=0.0).to(tl.float32)
-    b_output = tl.dot(b_later_m, b_earlier, input_precision=AFFINE_CHAIN_PRECISION)
-
-    p_later_e = later + i_h * stride_h + o_k[:, None] * (V + K) + o_c[None, :]
-    b_later_e = tl.load(
-        p_later_e,
-        mask=m_k[:, None] & (o_c[None, :] < V),
-        other=0.0,
-    ).to(tl.float32)
-    b_output += b_later_e
-
-    p_output = output + i_h * stride_h + o_k[:, None] * (V + K) + o_c[None, :]
-    tl.store(p_output, b_output, mask=m_k[:, None] & m_c[None, :])
-
-
-def compose_affine_pair(
-    earlier: torch.Tensor,
-    later: torch.Tensor,
-    *,
-    use_tf32x3_affine_chain: bool,
-) -> torch.Tensor:
-    """Return the affine map equivalent to applying ``earlier`` then ``later``."""
-    if earlier.shape != later.shape or earlier.ndim != 3:
-        raise ValueError(
-            "affine pair inputs must have matching [HV, K, V + K] shapes, "
-            f"got {tuple(earlier.shape)} and {tuple(later.shape)}"
-        )
-    HV, K, width = earlier.shape
-    V = width - K
-    output = torch.empty_like(earlier)
-    BK = triton.next_power_of_2(K)
-
-    def grid(meta):
-        return (triton.cdiv(V + K, meta['BC']), HV)
-
-    compose_affine_pair_kernel[grid](
-        earlier=earlier,
-        later=later,
-        output=output,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        AFFINE_CHAIN_PRECISION=("tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED else "ieee"),
-    )
-    return output
-
-
-def distributed_affine_exclusive_scan(
-    rank_summary: torch.Tensor,
-    *,
-    group: dist.ProcessGroup,
-    forward: bool,
-    use_tf32x3_affine_chain: bool,
-) -> torch.Tensor | None:
-    """Compute the ordered affine prefix/suffix preceding the local CP rank.
-
-    Recursive doubling exchanges one rank-sized composed summary per stage, so
-    a CP group of size eight takes three communication stages. ``partial`` is
-    the transform forwarded to later ranks in scan order. ``exclusive`` omits
-    the local rank and supplies its initial state.
-    """
-    world_size = dist.get_world_size(group=group)
-    if world_size == 1:
-        return None
-
-    rank = dist.get_rank(group=group)
-    partial = rank_summary.contiguous()
-    exclusive = None
-    distance = 1
-    while distance < world_size:
-        predecessor = rank - distance if forward else rank + distance
-        successor = rank + distance if forward else rank - distance
-        received = torch.empty_like(partial) if 0 <= predecessor < world_size else None
-        ops = []
-        if received is not None:
-            ops.append(
-                dist.P2POp(
-                    dist.irecv,
-                    received,
-                    dist.get_global_rank(group, predecessor),
-                    group=group,
-                )
-            )
-        if 0 <= successor < world_size:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    partial,
-                    dist.get_global_rank(group, successor),
-                    group=group,
-                )
-            )
-        for work in dist.batch_isend_irecv(ops):
-            work.wait()
-
-        if received is not None:
-            next_distance = distance * 2
-            next_successor = rank + next_distance if forward else rank - next_distance
-            if next_distance < world_size and 0 <= next_successor < world_size:
-                partial = compose_affine_pair(
-                    received,
-                    partial,
-                    use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-                )
-            exclusive = (
-                received
-                if exclusive is None
-                else compose_affine_pair(
-                    received,
-                    exclusive,
-                    use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-                )
-            )
-        distance *= 2
-    return exclusive
-
-
-@triton.autotune(
-    configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for BV in [32, 64]
         for num_warps in [2, 4]
         for num_stages in [2, 3]
     ],
-    key=['HV', 'K', 'V', 'NUM_LOCAL_SUMMARIES', 'FORWARD', 'HAS_RANK_PREFIX'],
+    key=['HV', 'K', 'V', 'NUM_GLOBAL_SUMMARIES', 'FORWARD'],
     **autotune_cache_kwargs,
 )
 @triton.jit
-def merge_local_affine_summaries_kernel(
+def merge_flat_affine_summaries_kernel(
     boundary_states,
-    hm,
-    rank_prefix,
+    ag_hm,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     NUM_LOCAL_SUMMARIES: tl.constexpr,
+    NUM_GLOBAL_SUMMARIES: tl.constexpr,
+    RANK: tl.constexpr,
     FORWARD: tl.constexpr,
-    HAS_RANK_PREFIX: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     AFFINE_CHAIN_PRECISION: tl.constexpr,
 ):
@@ -711,29 +561,29 @@ def merge_local_affine_summaries_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     m_k = o_k < K
     m_v = o_v < V
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
     stride_s = HV * K * (V + K)
     stride_h = K * (V + K)
+    local_start = RANK * NUM_LOCAL_SUMMARIES
+    local_end = local_start + NUM_LOCAL_SUMMARIES
 
-    if HAS_RANK_PREFIX:
-        p_prefix = rank_prefix + i_h * stride_h + o_k[:, None] * (V + K) + o_v[None, :]
-        b_h = tl.load(p_prefix, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
-    else:
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    for step in range(NUM_GLOBAL_SUMMARIES):
+        i_s = step if FORWARD else NUM_GLOBAL_SUMMARIES - 1 - step
+        if i_s >= local_start:
+            if i_s < local_end:
+                i_local = i_s - local_start
+                if STATE_V_FIRST:
+                    p_out = boundary_states + (i_local * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_out, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
+                else:
+                    p_out = boundary_states + (i_local * HV + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
+                    tl.store(p_out, b_h, mask=m_k[:, None] & m_v[None, :])
 
-    for step in range(NUM_LOCAL_SUMMARIES):
-        i_s = step if FORWARD else NUM_LOCAL_SUMMARIES - 1 - step
-        if STATE_V_FIRST:
-            p_out = boundary_states + (i_s * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
-            tl.store(p_out, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
-        else:
-            p_out = boundary_states + (i_s * HV + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
-            tl.store(p_out, b_h, mask=m_k[:, None] & m_v[None, :])
-
-        if step < NUM_LOCAL_SUMMARIES - 1:
+        if step < NUM_GLOBAL_SUMMARIES - 1:
             base = i_s * stride_s + i_h * stride_h
-            p_he = hm + base + o_k[:, None] * (V + K) + o_v[None, :]
+            p_he = ag_hm + base + o_k[:, None] * (V + K) + o_v[None, :]
             b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
-            p_m = hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
+            p_m = ag_hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
             b_m = tl.load(p_m, mask=m_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
             b_h = tl.dot(b_m, b_h, input_precision=AFFINE_CHAIN_PRECISION) + b_he
 
@@ -745,55 +595,42 @@ def merge_flat_affine_summaries(
     state_v_first: bool,
     use_tf32x3_affine_chain: bool,
 ) -> torch.Tensor | None:
-    """Return local boundary states using a distributed affine scan."""
+    """Return local boundary states from one global affine chain."""
     hm = summary.per_split
     num_local_summaries, HV, K, width = hm.shape
     V = width - K
     world_size = dist.get_world_size(group=group)
-    # Recursive doubling has a uniform send/receive schedule for power-of-two
-    # groups. Other sizes retain the existing hierarchical CP fallback.
-    if world_size & (world_size - 1):
+    num_global_summaries = world_size * num_local_summaries
+    if num_global_summaries > _FLAT_AFFINE_MAX_SUMMARIES:
         return None
-    rank_summary = summary.per_rank
-    if world_size != 1 and rank_summary is None:
-        rank_summary = compose_affine_summaries(
-            hm,
-            forward=summary.forward,
-            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        )
-    if world_size != 1 and rank_summary is None:
-        raise RuntimeError("distributed affine scan requires a rank summary")
-    rank_prefix = (
-        None
-        if world_size == 1
-        else distributed_affine_exclusive_scan(
-            rank_summary,
-            group=group,
-            forward=summary.forward,
-            use_tf32x3_affine_chain=use_tf32x3_affine_chain,
-        )
-    )
+
+    if world_size == 1:
+        ag_hm = hm
+    else:
+        gathered_hm, _ = all_gather_into_tensor(hm, group=group)
+        ag_hm = gathered_hm.flatten(0, 1)
 
     if state_v_first:
         boundary_states = hm.new_empty(num_local_summaries, HV, V, K)
     else:
         boundary_states = hm.new_empty(num_local_summaries, HV, K, V)
     BK = triton.next_power_of_2(K)
+    rank = dist.get_rank(group=group)
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), HV)
 
-    merge_local_affine_summaries_kernel[grid](
+    merge_flat_affine_summaries_kernel[grid](
         boundary_states=boundary_states,
-        hm=hm,
-        rank_prefix=rank_prefix,
+        ag_hm=ag_hm,
         HV=HV,
         K=K,
         V=V,
         BK=BK,
         NUM_LOCAL_SUMMARIES=num_local_summaries,
+        NUM_GLOBAL_SUMMARIES=num_global_summaries,
+        RANK=rank,
         FORWARD=summary.forward,
-        HAS_RANK_PREFIX=rank_prefix is not None,
         STATE_V_FIRST=state_v_first,
         AFFINE_CHAIN_PRECISION=(
             "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
