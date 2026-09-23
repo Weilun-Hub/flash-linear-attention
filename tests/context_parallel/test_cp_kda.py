@@ -523,7 +523,8 @@ def test_cp8_single_sequence():
     run_cp_test_with_spawn(
         world_size=8,
         test_name="CP8_SingleSequence",
-        T=65536, H=12, D=128,
+        # Keep the rank-0 recurrent reference below the NCCL watchdog timeout.
+        T=65536, H=4, D=128,
         lengths=[65536],
         dtype=torch.bfloat16,
         **GATE_KWARGS,

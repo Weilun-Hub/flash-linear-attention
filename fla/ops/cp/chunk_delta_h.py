@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
 
 
+# T and N are runtime geometry hints for autotuning. Variable-length kernels
+# derive their actual loop bounds from cu_seqlens; N distinguishes split grids.
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
@@ -35,10 +37,10 @@ if TYPE_CHECKING:
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
     ],
-    key=['H', 'HV', 'K', 'V', 'BT'],
+    key=['T', 'N', 'H', 'HV', 'K', 'V', 'BT', 'MULTI_SEQS'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'N'])
 def pre_process_fwd_kernel_merged(
     k,
     v,
@@ -50,6 +52,7 @@ def pre_process_fwd_kernel_merged(
     hm,
     cu_seqlens,
     T,
+    N,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -486,6 +489,7 @@ def merge_fwd_bwd_kernel(
         tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=m_h)
 
 
+# T and N serve the same autotuning purpose as in the forward preprocessor.
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
@@ -497,10 +501,10 @@ def merge_fwd_bwd_kernel(
         for num_warps in [2, 4]
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
     ],
-    key=['H', 'HV', 'K', 'V', 'BT'],
+    key=['T', 'N', 'H', 'HV', 'K', 'V', 'BT', 'MULTI_SEQS'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'N'])
 def pre_process_bwd_kernel_merged(
     q,
     k,
@@ -513,6 +517,7 @@ def pre_process_bwd_kernel_merged(
     cu_seqlens,
     scale,
     T,
+    N,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -845,6 +850,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
                     hm=hm[part],
                     cu_seqlens=cu_win,
                     T=T,
+                    N=1,
                     H=H,
                     HV=HV,
                     K=K,
@@ -932,6 +938,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
             hm=hm,
             cu_seqlens=cu_last,
             T=T,
+            N=1,
             H=H,
             HV=HV,
             K=K,
@@ -1044,6 +1051,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                     cu_seqlens=cu_win,
                     scale=scale,
                     T=T,
+                    N=1,
                     H=H,
                     HV=HV,
                     K=K,
@@ -1127,6 +1135,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
             cu_seqlens=cu_seqlens[:2],
             scale=scale,
             T=T,
+            N=1,
             H=H,
             HV=HV,
             K=K,
