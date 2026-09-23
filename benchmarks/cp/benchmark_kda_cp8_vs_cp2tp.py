@@ -31,6 +31,7 @@ import random
 
 import torch
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_reduce
 
 from fla.ops.cp import build_cp_context
 from fla.ops.kda import chunk_kda
@@ -77,6 +78,12 @@ def all_gather(x, group=None) -> torch.Tensor:
     return y
 
 
+def _clear_grads(grad_to_none):
+    if grad_to_none is not None:
+        for x in grad_to_none:
+            x.grad = None
+
+
 def bench(fn, step=20, warm_up=10, grad_to_none=None):
     """Benchmark function with CUDA events."""
     start_event = torch.cuda.Event(enable_timing=True)
@@ -85,15 +92,14 @@ def bench(fn, step=20, warm_up=10, grad_to_none=None):
     # Warmup
     for i in range(warm_up):
         fn()
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
+        _clear_grads(grad_to_none)
 
     # Benchmark
     torch.cuda.synchronize()
     start_event.record()
     for i in range(step):
         fn()
+        _clear_grads(grad_to_none)
     end_event.record()
     torch.cuda.synchronize()
 
@@ -101,7 +107,7 @@ def bench(fn, step=20, warm_up=10, grad_to_none=None):
     return elapsed_time / step
 
 
-def profile_kernels(fn, steps=5, warmup=2):
+def profile_kernels(fn, steps=5, warmup=2, grad_to_none=None):
     """Profile individual kernels using PyTorch profiler."""
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -109,6 +115,7 @@ def profile_kernels(fn, steps=5, warmup=2):
     # Warmup
     for _ in range(warmup):
         fn()
+        _clear_grads(grad_to_none)
 
     # Profile
     profile_step_times = []
@@ -133,6 +140,7 @@ def profile_kernels(fn, steps=5, warmup=2):
             torch.cuda.synchronize()
             if profile_step > 0:
                 profile_step_times.append(start_event.elapsed_time(end_event))
+            _clear_grads(grad_to_none)
             prof.step()
 
     # Get kernel stats
@@ -348,12 +356,10 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            dist.all_reduce(o, group=tp_group)
+            o = all_reduce(o, op=dist.ReduceOp.SUM, group=tp_group)
 
-        dist.barrier()
         if run_backward:
             o.backward(do)
-            dist.barrier()
         return o
 
     def kda_with_all2all_cp():
@@ -385,16 +391,14 @@ def run_benchmark(args):
 
         # TP all-reduce for output (if TP size > 1)
         if tp_size > 1:
-            dist.all_reduce(o_full, group=tp_group)
+            o_full = all_reduce(o_full, op=dist.ReduceOp.SUM, group=tp_group)
 
-        dist.barrier()
         if run_backward:
             if cp_size > 1:
                 do_full = all_gather(do.squeeze(0), group=cp_group).unsqueeze(0)
             else:
                 do_full = do
             o_full.backward(do_full)
-            dist.barrier()
 
         # Scatter output (take local portion)
         if cp_size > 1:
@@ -430,7 +434,12 @@ def run_benchmark(args):
     # run kernel profiling on every rank because the measured function contains distributed collectives
     if profile_kernels_flag:
         dist.barrier()
-        kernel_stats, profile_step_time = profile_kernels(kda_with_cp, steps=5, warmup=2)
+        kernel_stats, profile_step_time = profile_kernels(
+            kda_with_cp,
+            steps=5,
+            warmup=2,
+            grad_to_none=[q, k, v, g, beta] if run_backward else None,
+        )
         profile_step_times = gather_rank_times(profile_step_time, device)
         kernel_stats_by_rank = [None] * world_size
         dist.all_gather_object(kernel_stats_by_rank, kernel_stats)
@@ -442,7 +451,7 @@ def run_benchmark(args):
             print(format_rank_time_table("Profiler step", profile_step_times, tp_size))
             for profile_rank, stats in enumerate(kernel_stats_by_rank):
                 print(f"\nRank {profile_rank} kernel profile:")
-                print(format_kernel_table(stats, top_n=20))
+                print(format_kernel_table(stats, top_n=50))
             print()
 
     # Run benchmarks
