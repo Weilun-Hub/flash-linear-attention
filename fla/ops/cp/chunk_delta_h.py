@@ -33,7 +33,8 @@ if TYPE_CHECKING:
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'BLOCK_SIZE': block_size}, num_warps=num_warps, num_stages=num_stages)
+        for block_size in [32, 64]
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
     ],
@@ -497,7 +498,8 @@ def merge_fwd_bwd_kernel(
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'BLOCK_SIZE': block_size}, num_warps=num_warps, num_stages=num_stages)
+        for block_size in [32, 64]
         for num_warps in [2, 4]
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
     ],
@@ -833,8 +835,9 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
             initial_state = k.new_zeros(N, HV, V, K, dtype=torch.float32)
         else:
             initial_state = k.new_zeros(N, HV, K, V, dtype=torch.float32)
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid_hm = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
+        def grid_hm(meta):
+            return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+
         # each part exports the affine chain of its last segment, skipped when chain-last
         for part, (cu_win, is_last) in enumerate(zip(
                 (cu_seqlens[fns - 1: fns + 1], cu_seqlens[-2:]), context.is_last_by_part)):
@@ -857,7 +860,6 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
                     V=V,
                     BT=BT,
                     BK1=BK,
-                    BLOCK_SIZE=BLOCK_SIZE,
                     MULTI_SEQS=False,
                     AFFINE_CHAIN_PRECISION=(
                         "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
@@ -923,8 +925,9 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     # graph mode always launches: a last rank's hm is never read, but the all-gather
     # needs every rank, and host-side flags are frozen at capture
     if precomputed_hm is None and (use_graph or not context.is_last_rank):
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
+        def grid(meta):
+            return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+
         # For DPLR, v provides the original v for computing h contributions,
         # while u remains the WY-processed values (A_ab @ A_ak @ v) for v_new = w @ h + u.
         pre_process_fwd_kernel_merged[grid](
@@ -945,7 +948,6 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
             V=V,
             BT=BT,
             BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
             MULTI_SEQS=False,
             AFFINE_CHAIN_PRECISION=(
                 "tf32x3" if use_tf32x3_affine_chain and IS_TF32_SUPPORTED
@@ -1033,8 +1035,9 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
             dht = q.new_zeros(N, HV, V, K, dtype=torch.float32)
         else:
             dht = q.new_zeros(N, HV, K, V, dtype=torch.float32)
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid_hm = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
+        def grid_hm(meta):
+            return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+
         # each part exports the backward affine chain of its first segment, skipped when chain-first
         for part, (cu_win, is_first) in enumerate(zip(
                 (cu_seqlens[:2], cu_seqlens[fns: fns + 2]), context.is_first_by_part)):
@@ -1058,7 +1061,6 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                     V=V,
                     BT=BT,
                     BK1=BK,
-                    BLOCK_SIZE=BLOCK_SIZE,
                     USE_BG=bg is not None,
                     MULTI_SEQS=False,
                     AFFINE_CHAIN_PRECISION=(
@@ -1121,8 +1123,9 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     # graph mode always launches: a first rank's dhm is never read, but the all-gather
     # needs every rank, and host-side flags are frozen at capture
     if precomputed_dhm is None and (use_graph or not context.is_first_rank):
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
+        def grid(meta):
+            return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+
         pre_process_bwd_kernel_merged[grid](
             q=q,
             k=k if bg is None else bg,
@@ -1142,7 +1145,6 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
             V=V,
             BT=BT,
             BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=bg is not None,
             MULTI_SEQS=False,
             AFFINE_CHAIN_PRECISION=(

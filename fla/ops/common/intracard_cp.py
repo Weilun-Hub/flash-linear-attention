@@ -360,12 +360,13 @@ def intracard_pre_scan(
 ):
     H, K, V, HV = kg.shape[2], kg.shape[3], u.shape[3], u.shape[2]
     BK = triton.next_power_of_2(K)
-    BLOCK_SIZE = 32 if K <= 64 else 64
 
     hm = kg.new_empty(S_split, HV, K, V + K, dtype=torch.float32)
     split_len_hint = triton.cdiv(kg.shape[1], S_split)
 
-    grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV, S_split)
+    def grid(meta):
+        return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV, S_split)
+
     pre_process_fwd_kernel_merged[grid](
         k=kg,
         v=u,
@@ -383,7 +384,6 @@ def intracard_pre_scan(
         K=K,
         V=V,
         BT=chunk_size,
-        BLOCK_SIZE=BLOCK_SIZE,
         BK1=BK,
         MULTI_SEQS=True,
         AFFINE_CHAIN_PRECISION=(
@@ -411,11 +411,12 @@ def intracard_pre_scan_bwd(
 ) -> torch.Tensor:
     H, K, V, HV = q.shape[2], q.shape[3], do.shape[3], do.shape[2]
     BK = triton.next_power_of_2(K)
-    BLOCK_SIZE = 32 if K <= 64 else 64
     dhm = q.new_empty(S_split, HV, K, V + K, dtype=torch.float32)
     split_len_hint = triton.cdiv(q.shape[1], S_split)
 
-    grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV, S_split)
+    def grid(meta):
+        return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV, S_split)
+
     pre_process_bwd_kernel_merged[grid](
         q=q,
         k=k,
@@ -434,7 +435,6 @@ def intracard_pre_scan_bwd(
         K=K,
         V=V,
         BT=chunk_size,
-        BLOCK_SIZE=BLOCK_SIZE,
         BK1=BK,
         USE_BG=False,
         MULTI_SEQS=True,
