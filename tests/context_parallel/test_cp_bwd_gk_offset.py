@@ -103,8 +103,9 @@ class TestBwdGkOffset:
         cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.long)
 
         BK = triton.next_power_of_2(K)
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), H)
+
+        def grid(meta):
+            return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), H)
 
         # Run A: all gk = 0
         dhm_a = torch.zeros(H, K, V + K, dtype=torch.float32, device=device)
@@ -127,7 +128,6 @@ class TestBwdGkOffset:
             V=V,
             BT=BT,
             BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=False,
             MULTI_SEQS=False,
         )
@@ -153,7 +153,6 @@ class TestBwdGkOffset:
             V=V,
             BT=BT,
             BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
             USE_BG=False,
             MULTI_SEQS=False,
         )
