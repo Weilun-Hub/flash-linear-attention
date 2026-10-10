@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE': block_size}, num_warps=num_warps, num_stages=num_stages)
-        for block_size in [32, 64]
+        for block_size in [16, 32, 64]
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
     ],
