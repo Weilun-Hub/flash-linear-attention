@@ -16,6 +16,7 @@ lists to minimize cudaStreamSynchronize calls.
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from collections import OrderedDict
 from typing import NamedTuple
@@ -947,17 +948,33 @@ def _prepare_intracard_cache_entry(
     max_splits: int,
     device: torch.device,
 ) -> _CacheEntry | None:
+    """Prepare partitions; a forced count requires one equally chunk-divisible sequence."""
+    forced_splits = int(os.environ.get('FLA_INTRACARD_FORCE_SPLITS', '0'))
+    if forced_splits < 0 or forced_splits > max_splits:
+        raise ValueError(f"FLA_INTRACARD_FORCE_SPLITS must be between 0 and {max_splits}, got {forced_splits}")
+
     if cu_seqlens_cpu is None:
         cu_seqlens_cpu = cu_seqlens.cpu()
 
+    if forced_splits:
+        if cu_seqlens_cpu.numel() != 2 or int(cu_seqlens_cpu[0].item()) != 0:
+            raise ValueError("FLA_INTRACARD_FORCE_SPLITS requires one local sequence starting at zero")
+        if forced_splits == 1:
+            return None
+
     seq_lens = torch.diff(cu_seqlens_cpu)
     max_seq_len = int(seq_lens.max().item())
-    subseq_len = compute_subseq_len(max_seq_len, get_multiprocessor_count(), num_heads, chunk_size)
+    if forced_splits:
+        if max_seq_len <= 0 or max_seq_len % (forced_splits * chunk_size) != 0:
+            raise ValueError("Local sequence length must be positive and divisible by forced_splits * chunk_size")
+        subseq_len = max_seq_len // forced_splits
+    else:
+        subseq_len = compute_subseq_len(max_seq_len, get_multiprocessor_count(), num_heads, chunk_size)
     if (seq_lens < 2 * subseq_len).all():
         return None
 
     cu_seqlens_fingerprint = tuple(cu_seqlens_cpu.tolist())
-    cache_key = (id(cu_seqlens), cu_seqlens_fingerprint, subseq_len, chunk_size, max_splits, str(device))
+    cache_key = (id(cu_seqlens), cu_seqlens_fingerprint, subseq_len, chunk_size, max_splits, forced_splits, str(device))
     cached = _intracard_cache.get(cache_key)
     if cached is not None:
         if cached.cu_seqlens_ref() is cu_seqlens:

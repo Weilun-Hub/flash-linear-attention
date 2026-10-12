@@ -328,6 +328,28 @@ def run_benchmark(args):
     cp_context = build_cp_context(cu_seqlens, cp_group)
     cp_cu_seqlens = cp_context.cu_seqlens
 
+    if os.environ.get('FLA_INTRACARD_CP', '0') == '1':
+        from fla.ops.common.backends.intracard import MAX_SUBSEQS, IntraCardCPBackend
+        from fla.ops.common.intracard_cp import _prepare_intracard_cache_entry
+
+        if IntraCardCPBackend.is_enabled() and 16 <= K <= 128:
+            split_metadata = _prepare_intracard_cache_entry(
+                cu_seqlens=cp_cu_seqlens,
+                cu_seqlens_cpu=cp_cu_seqlens.cpu(),
+                num_heads=H_local,
+                chunk_size=64,
+                max_splits=MAX_SUBSEQS,
+                device=device,
+            )
+            actual_splits = 1 if split_metadata is None else split_metadata.total_subseqs
+            print(
+                f"[Rank {rank}] intracard: forced_splits={os.environ.get('FLA_INTRACARD_FORCE_SPLITS', '0')} "
+                f"max_splits={MAX_SUBSEQS} actual_splits={actual_splits}",
+                flush=True,
+            )
+        else:
+            print(f"[Rank {rank}] intracard split override is inactive for this configuration", flush=True)
+
     # Debug: print cp_context info
     print(f"[Rank {rank}] cp_context: cu_seqlens={cp_context.cu_seqlens.tolist()}, "
           f"is_cp_enabled={cp_context.is_cp_enabled}, is_first_rank={cp_context.is_first_rank}, "

@@ -55,6 +55,7 @@ Each backend is gated by a single env var below.
 | `FLA_FLASH_KDA`                | unset (`1`) | `0` / `1`  | Enable the [FlashKDA](https://github.com/MoonshotAI/FlashKDA) CUTLASS forward for `chunk_kda` (inference only). Requires `flash_kda`.    |
 | `FLA_INTRACARD_CP`             | unset (`0`) | `0` / `1`  | Opt in to the intra-card context-parallel backend for shared delta-rule state scans. Variable-length inputs only; graph mode falls back. |
 | `FLA_INTRACARD_MAX_SPLITS`     | `32`        | int ≥ 1    | Max number of sub-sequences per original sequence used by the intra-card CP backend. Caps merge-chain depth to control precision loss.  |
+| `FLA_INTRACARD_FORCE_SPLITS`   | `0`         | int ≥ 0    | Experimental exact local split count. `0` uses the heuristic; `1` disables local splitting. Requires one local sequence starting at zero; counts above one require a positive length divisible by `count * chunk_size`. Must not exceed `FLA_INTRACARD_MAX_SPLITS`. Set before launching and keep fixed through forward/backward. |
 | `FLA_INTRACARD_TF32X3`         | `0`         | `0` / `1`  | Use tf32x3 for the affine-chain dots in the pre-scan/merge kernels of the intra-card CP backend. NVIDIA only.                            |
 
 ---
