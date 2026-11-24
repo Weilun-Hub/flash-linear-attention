@@ -10,13 +10,14 @@ import triton
 import triton.language as tl
 
 from fla.ops.backends import dispatch
+from fla.ops.kda.backward_tuning import fixed_kernel, launch_config
 from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.graph import get_static_buffer
 from fla.ops.utils.op import exp2, gather
-from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_GATHER_SUPPORTED, IS_NVIDIA, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -427,7 +428,7 @@ def chunk_kda_bwd_kernel_intra(
     USE_GATHER: tl.constexpr,
     USE_GRAPH: tl.constexpr = False,
 ):
-    i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_kc, i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_hv = i_bh // HV, i_bh % HV
     i_h = i_hv // (HV // H)
     i_k, i_i = i_kc // NC, i_kc % NC
@@ -929,10 +930,20 @@ def chunk_kda_bwd_intra(
     safe_gate: bool = False,
     use_graph: bool = False,
 ):
+    """Accumulate intra-chunk gradients into separate output buffers."""
     B, T, H, K, HV = *k.shape, g.shape[2]
     BT = chunk_size
     BC = min(16, BT)
     BK = min(32, triton.next_power_of_2(K))
+
+    config = launch_config('FLA_KDA_BWD_INTRA_TILE', (16, 32, 64), (1, 2, 4, 8))
+    config = config if IS_NVIDIA and not use_graph else None
+    kernel = chunk_kda_bwd_kernel_intra
+    launch = {}
+    if config is not None:
+        BK, warps, stages = config
+        kernel = fixed_kernel(kernel)
+        launch = dict(IS_VARLEN=cu_seqlens is not None, num_warps=warps, num_stages=stages)
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -951,7 +962,7 @@ def chunk_kda_bwd_intra(
         db2 = beta.new_empty(NK, *beta.shape, dtype=torch.float)
         dg2 = torch.empty_like(dg, dtype=torch.float)
     grid = (NK * NC, NT, B * HV)
-    chunk_kda_bwd_kernel_intra[grid](
+    kernel[grid](
         q=q,
         k=k,
         g=g,
@@ -979,6 +990,7 @@ def chunk_kda_bwd_intra(
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
         USE_GRAPH=use_graph,
+        **launch,
     )
     dq = dq2
     dk = dk2

@@ -5,13 +5,15 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import triton
 from einops import rearrange
 
 from fla.modules.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import input_guard
+from fla.utils import IS_NVIDIA, input_guard
 
 from .kernels import (
     causal_conv1d_bwd_kernel,
@@ -174,8 +176,13 @@ def causal_conv1d_bwd(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
     NB = triton.cdiv(B*T, 1024)
 
+    option = os.environ.get('FLA_CONV_BWD_RECOMPUTE_SILU', '0')
+    if option not in ('0', '1'):
+        raise ValueError('FLA_CONV_BWD_RECOMPUTE_SILU must be 0 or 1')
+    fused_silu = (option == '1' and IS_NVIDIA and activation in ('silu', 'swish')
+                  and weight is not None and W <= 8 and initial_state is None and dht is None)
     y = None
-    if activation is not None:
+    if activation is not None and not fused_silu:
         y, _ = causal_conv1d_fwd(
             x=x,
             weight=weight,
@@ -200,6 +207,7 @@ def causal_conv1d_bwd(
         x=x,
         y=y,
         weight=weight,
+        bias=bias,
         initial_state=initial_state,
         dht=dht,
         dy=dy,
@@ -225,6 +233,7 @@ def causal_conv1d_bwd(
         stride_dy_t=stride_dy_t,
         stride_dy_d=stride_dy_d,
         ACTIVATION=activation,
+        RECOMPUTE_SILU=fused_silu,
     )
     if weight is not None:
         dw = dw.sum(0).to(weight)

@@ -138,6 +138,27 @@ def causal_conv1d_fwd_kernel(
     tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_y)
 
 
+@triton.jit
+def _conv_preactivation_for_backward(
+    x, weight, bias, positions, channels, length,
+    stride_t, stride_d, D: tl.constexpr, W: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    value = tl.zeros((BT, BD), tl.float32)
+    for tap in tl.static_range(W):
+        tokens = positions + tap - W + 1
+        samples = tl.load(
+            x + tokens[:, None] * stride_t + channels[None, :] * stride_d,
+            mask=((tokens >= 0) & (tokens < length))[:, None] & (channels < D)[None, :], other=0,
+        ).to(tl.float32)
+        weights = tl.load(weight + channels * W + tap, mask=channels < D, other=0).to(tl.float32)
+        value += samples * weights[None, :]
+    if HAS_BIAS:
+        value += tl.load(bias + channels, mask=channels < D, other=0).to(tl.float32)[None, :]
+    # preserve the stored preactivation's rounding before the SiLU derivative
+    return value.to(x.dtype.element_ty).to(tl.float32)
+
+
 @triton.heuristics({
     'HAS_WEIGHT': lambda args: args['dw'] is not None,
     'HAS_BIAS': lambda args: args['db'] is not None,
@@ -151,7 +172,7 @@ def causal_conv1d_fwd_kernel(
         for BD in [16, 32, 64, 128]
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D', 'W'],
+    key=['D', 'W', 'RECOMPUTE_SILU'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -159,6 +180,7 @@ def causal_conv1d_bwd_kernel(
     x,
     y,
     weight,
+    bias,
     initial_state,
     dht,
     dy,
@@ -190,11 +212,12 @@ def causal_conv1d_bwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     USE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    RECOMPUTE_SILU: tl.constexpr = False,
 ):
-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_d, i_t, i_b = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     if IS_VARLEN:
         i_tg = i_t
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int64), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
         p_x = x + bos * stride_x_t
@@ -216,6 +239,7 @@ def causal_conv1d_bwd_kernel(
     m_w = o_w >= 0
     m_x = (o_t < T)[:, None] & m_d[None, :]
 
+    p_input = p_x
     if HAS_WEIGHT:
         p_x = p_x + o_t[:, None] * stride_x_t + o_d[None, :] * stride_x_d
         b_x = tl.load(p_x, mask=m_x, other=0.0)
@@ -233,8 +257,13 @@ def causal_conv1d_bwd_kernel(
             # [BT, BD]
             b_dy = tl.load(p_dy_blk, mask=((o_dy < T)[:, None] & m_d[None, :]), other=0.0).to(tl.float32)
             if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-                p_y = y + bos * D + o_dy[:, None] * D + o_d[None, :]
-                b_y = tl.load(p_y, mask=((o_dy < T)[:, None] & m_d[None, :]), other=0.0).to(tl.float32)
+                if RECOMPUTE_SILU:
+                    b_y = _conv_preactivation_for_backward(
+                        p_input, weight, bias, o_dy, o_d, T, stride_x_t, stride_x_d, D, W, BT, BD, HAS_BIAS,
+                    )
+                else:
+                    p_y = y + bos * D + o_dy[:, None] * D + o_d[None, :]
+                    b_y = tl.load(p_y, mask=((o_dy < T)[:, None] & m_d[None, :]), other=0.0).to(tl.float32)
                 b_ys = tl.sigmoid(b_y)
                 b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
             b_wdy = b_dy

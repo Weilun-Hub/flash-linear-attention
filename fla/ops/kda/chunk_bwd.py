@@ -17,6 +17,7 @@ from fla.ops.common.chunk_delta_h import (
 )
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu_pre_process, expand_h0
+from fla.ops.kda.backward_tuning import reconstruct_state
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
 from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
@@ -522,7 +523,8 @@ def chunk_kda_bwd(
             # Restore the full initial_state tensor from the compressed version.
             # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
             initial_state = expand_h0(initial_state, context=cp_context)
-        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+        state_fn = chunk_gated_delta_rule_fwd_h if use_graph else reconstruct_state
+        h, v_new, _ = state_fn(
             k=kg,
             w=w,
             u=u,
@@ -649,6 +651,11 @@ def chunk_kda_bwd(
         **intra_summary_kwargs,
     )
 
+    if not disable_recompute and not use_graph:
+        # The state-gradient kernel is their final consumer. Release these
+        # recomputed tensors before allocating the fused backward outputs.
+        del w, u, qg, kg
+
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
         q=q,
         k=k,
@@ -668,6 +675,11 @@ def chunk_kda_bwd(
         state_v_first=state_v_first,
         use_graph=use_graph,
     )
+
+    if not disable_recompute and not use_graph:
+        # These recomputed tensors have no remaining consumers. Release them
+        # before allocating the intra-chunk backward scratch buffers.
+        del h, v_new, dh
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
         q=q,

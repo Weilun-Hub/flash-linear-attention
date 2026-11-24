@@ -28,6 +28,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.utils import check_shared_mem
 
 from ._utils import canonicalize_contiguous_strides
+from .tuning import backward_launch_config
 
 
 @tilelang.jit(pass_configs={
@@ -40,6 +41,7 @@ def _build_kda_bwd_kernel(
     dtype_str,
     STATE_V_FIRST, IS_VARLEN=False,
     num_warps=4,
+    HEAD_FIRST=False,
 ):
     dtype_map = {'float16': T.float16, 'bfloat16': T.bfloat16, 'float32': T.float32}
     dtype = dtype_map[dtype_str]
@@ -56,6 +58,7 @@ def _build_kda_bwd_kernel(
     _threads = threads
     _TS = STATE_V_FIRST
     _VAR = IS_VARLEN
+    _HEAD_FIRST = HEAD_FIRST
 
     T_d, NT_d, total_h_d, N_seqs_d = T.dynamic("T, NT, total_h, N_seqs")
 
@@ -381,15 +384,20 @@ def _build_kda_bwd_kernel(
             scale: T.float32,
         ):
             with T.Kernel(NT_d, _H, threads=_threads) as (i_t, i_h):
-                i_n = chunk_indices[i_t, 0]
-                i_t_local = chunk_indices[i_t, 1]
+                linear_cta = T.cast(i_h, 'int64') * NT_d + i_t
+                # Decode into the original int32 grid domains so T.copy's
+                # layout inference does not promote its local loop variables.
+                tile_t = T.cast(linear_cta // _H, 'int32') if _HEAD_FIRST else i_t
+                tile_h = T.cast(linear_cta % _H, 'int32') if _HEAD_FIRST else i_h
+                i_n = chunk_indices[tile_t, 0]
+                i_t_local = chunk_indices[tile_t, 1]
                 bos = cu_seqlens[i_n]
                 T_seq = cu_seqlens[i_n + 1] - bos
-                h_idx = i_t * _H + i_h
+                h_idx = T.cast(tile_t, 'int64') * _H + tile_h
                 t_s = bos + i_t_local * _BT
                 kernel_body(q, k, v, v_new, g, beta, A, h, do, dh,
                             dq, dk, dv, dv2, dg, db, dA,
-                            scale, 0, i_h, t_s, T_seq, i_t_local, h_idx)
+                            scale, 0, tile_h, t_s, T_seq, i_t_local, h_idx)
     else:
         @T.prim_func
         def kernel(
@@ -406,14 +414,19 @@ def _build_kda_bwd_kernel(
             scale: T.float32,
         ):
             with T.Kernel(T.ceildiv(T_d, _BT), _B * _H, threads=_threads) as (i_t, i_bh):
-                i_b = i_bh // _H
-                i_h = i_bh % _H
                 NT_local = T.ceildiv(T_d, _BT)
-                h_idx = (i_b * NT_local + i_t) * _H + i_h
-                t_s = i_t * _BT
+                linear_cta = T.cast(i_bh, 'int64') * NT_local + i_t
+                # Keep coordinates int32; only the flattened product and
+                # state address arithmetic require widening to int64.
+                tile_t = T.cast(linear_cta // (_B * _H), 'int32') if _HEAD_FIRST else i_t
+                tile_bh = T.cast(linear_cta % (_B * _H), 'int32') if _HEAD_FIRST else i_bh
+                i_b = tile_bh // _H
+                i_h = tile_bh % _H
+                h_idx = (T.cast(i_b, 'int64') * NT_local + tile_t) * _H + i_h
+                t_s = tile_t * _BT
                 kernel_body(q, k, v, v_new, g, beta, A, h, do, dh,
                             dq, dk, dv, dv2, dg, db, dA,
-                            scale, i_b, i_h, t_s, T_d, i_t, h_idx)
+                            scale, i_b, i_h, t_s, T_d, tile_t, h_idx)
 
     return kernel
 
@@ -456,12 +469,14 @@ def chunk_kda_bwd_wy_dqkg_fused_tilelang(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     num_warps = 8 if K <= 64 else 4
+    BK, BV, num_warps, head_first = backward_launch_config(K, V, BK, BV, num_warps)
 
     kernel = _build_kda_bwd_kernel(
         B, H, K, V, BT, BK, BV,
         hD1, hD2, dtype_str,
         state_v_first, IS_VARLEN,
         num_warps=num_warps,
+        HEAD_FIRST=head_first,
     )
 
     if IS_VARLEN:

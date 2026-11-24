@@ -14,6 +14,8 @@ import torch
 from fla.ops.backends import BaseBackend
 from fla.utils import find_spec_cached, has_usable_nvcc
 
+from .tuning import backward_shape_supported
+
 _TILELANG_AVAILABLE = find_spec_cached("tilelang") is not None
 
 
@@ -54,6 +56,8 @@ class KDATileLangBackend(BaseBackend):
                 "TileLang backend does not support GQA (v has more heads than k); "
                 "use repeat_interleave on k/q to match v's head count, or fall back to Triton"
             )
+        if not backward_shape_supported(k.shape[-1], v.shape[-1]):
+            return False, 'TileLang WY tiles require divisible head dimensions; falling back to Triton'
         return True, None
 
     def chunk_kda_bwd_wy_dqkg_fused(
