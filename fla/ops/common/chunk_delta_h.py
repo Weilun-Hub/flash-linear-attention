@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from contextvars import ContextVar
+
 import torch
 import triton
 import triton.language as tl
@@ -35,6 +37,40 @@ elif IS_INTEL:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4, 8, 16]
 else:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4]
+
+
+def _blackwell_dhu_cached_config_supported(config):
+    return (
+        config.num_warps == 2 and config.num_stages == 3
+        and config.kwargs in ({'BV': 32}, {'BV': 64})
+        and getattr(config, 'num_ctas', 1) == 1
+        and getattr(config, 'maxnreg', None) is None
+        and not getattr(config, 'ir_override', None)
+    )
+
+
+# Scope overrides to the KDA call, including an intra-card backend's sub-scans.
+# Other users of the shared delta-rule kernel keep their existing launch policy.
+_KDA_DHU_LAUNCH_CONFIG = ContextVar('kda_dhu_launch_config', default=None)
+
+
+def _state_backward_launch(g, gk, dh0, dht, cu_seqlens):
+    kernel = chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64
+    config = _KDA_DHU_LAUNCH_CONFIG.get()
+    if config is None:
+        return kernel, {}
+    from triton.runtime import JITFunction
+
+    bv, head_first = config
+    if not IS_NVIDIA_BLACKWELL or bv not in (16, 32, 64):
+        raise ValueError('Explicit dhu launch requires Blackwell and BV=16/32/64')
+    while not isinstance(kernel, JITFunction):
+        kernel = kernel.fn
+    return kernel, dict(
+        BV=bv, HEAD_FIRST=head_first, num_warps=2, num_stages=3,
+        USE_G=g is not None, USE_GK=gk is not None, USE_INITIAL_STATE=dh0 is not None,
+        USE_FINAL_STATE_GRADIENT=dht is not None, IS_VARLEN=cu_seqlens is not None,
+    )
 
 
 @triton.heuristics({
@@ -360,11 +396,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 @fla_cache_autotune(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
+        # four-warp Blackwell launches corrupt dh/dv across repeated calls;
+        # retain the two-warp, three-stage configurations validated against the recurrence
+        for num_warps in ([2] if IS_NVIDIA_BLACKWELL else [2, 4])
+        for num_stages in ([3] if IS_NVIDIA_BLACKWELL else ([2, 3, 4] if check_shared_mem('ampere') else [1]))
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['T', 'N', 'H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
+    cached_config_filter=_blackwell_dhu_cached_config_supported if IS_NVIDIA_BLACKWELL else None,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T', 'N'])
@@ -397,11 +436,18 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HEAD_FIRST: tl.constexpr = False,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
-    i_v, i_nh = pid % NV, (pid // NV).to(tl.int64)
-    i_n, i_h = i_nh // HV, i_nh % HV
+    if HEAD_FIRST:
+        i_h = pid % HV
+        i_v = (pid // HV) % NV
+        i_n = pid // (HV * NV)
+        i_nh = i_n * HV + i_h
+    else:
+        i_v, i_nh = pid % NV, pid // NV
+        i_n, i_h = i_nh // HV, i_nh % HV
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
@@ -843,7 +889,8 @@ def chunk_gated_delta_rule_bwd_dhu(
         dv2 = torch.empty_like(dv)
 
     def grid(meta): return (triton.cdiv(V, meta['BV']) * N * HV, )
-    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
+    kernel, launch_kwargs = _state_backward_launch(g, gk, dh0, dht, cu_seqlens)
+    kernel[grid](
         q=q,
         k=k,
         w=w,
@@ -866,5 +913,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        **launch_kwargs,
     )
     return dh, dh0, dv2

@@ -5,12 +5,14 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from fla.ops.backends import dispatch
-from fla.ops.kda.backward_tuning import fixed_kernel, launch_config
+from fla.ops.kda.backward_tuning import fixed_kernel, intra_dot_precision, launch_config
 from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
@@ -394,7 +396,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BK', 'NC', 'BT', 'HV'],
+    key=['BK', 'NC', 'BT', 'HV', 'HEAD_FIRST', 'DOT_INPUT_PRECISION'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['B', 'T'])
@@ -427,8 +429,12 @@ def chunk_kda_bwd_kernel_intra(
     SAFE_GATE: tl.constexpr,
     USE_GATHER: tl.constexpr,
     USE_GRAPH: tl.constexpr = False,
+    HEAD_FIRST: tl.constexpr = False,
+    DOT_INPUT_PRECISION: tl.constexpr = 'ieee',
 ):
     i_kc, i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    if HEAD_FIRST:
+        i_t, i_bh = i_bh, i_t
     i_b, i_hv = i_bh // HV, i_bh % HV
     i_h = i_hv // (HV // H)
     i_k, i_i = i_kc // NC, i_kc % NC
@@ -476,10 +482,11 @@ def chunk_kda_bwd_kernel_intra(
     b_g = tl.load(p_g, mask=m_ck, other=0.0).to(tl.float32)
 
     p_b = beta + o_c * HV
-    b_b = tl.load(p_b, mask=m_c, other=0.0)
+    b_b = tl.load(p_b, mask=m_c, other=0.0).to(tl.float32)
 
     b_dq2 = tl.zeros([BC, BK], dtype=tl.float32)
     b_dk2 = tl.zeros([BC, BK], dtype=tl.float32)
+    # gate-gradient cancellation requires accurate FP32 dot products
     if i_i > 0:
         p_gn = g + i_ti * HV*K + o_k
         # [BK,]
@@ -499,8 +506,8 @@ def chunk_kda_bwd_kernel_intra(
             b_dAqk = tl.load(p_dAqk, mask=m_dAf, other=0.0)
             b_dAkk = tl.load(p_dAkk, mask=m_dAf, other=0.0)
             # [BC, BK]
-            b_dq2 = tl.dot(b_dAqk, b_kg, b_dq2)
-            b_dk2 = tl.dot(b_dAkk, b_kg, b_dk2)
+            b_dq2 = tl.dot(b_dAqk, b_kg, b_dq2, input_precision=DOT_INPUT_PRECISION)
+            b_dk2 = tl.dot(b_dAkk, b_kg, b_dk2, input_precision=DOT_INPUT_PRECISION)
         b_gqn = exp2(b_g - b_gn)
         b_dq2 *= b_gqn
         b_dk2 *= b_gqn
@@ -538,8 +545,8 @@ def chunk_kda_bwd_kernel_intra(
         exp_neg_b_g_diag_qk = tl.where(m_j_diag_qk, exp2(-b_g_diag_qk), 0.)
 
         b_k_exp_diag_qk = b_k * exp_neg_b_g_diag_qk
-        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
-        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
+        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk, input_precision=DOT_INPUT_PRECISION) * exp_b_g_diag_qk
+        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk, input_precision=DOT_INPUT_PRECISION) * exp_b_g_diag_qk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             # [BC]
@@ -590,7 +597,8 @@ def chunk_kda_bwd_kernel_intra(
             p_dAqk = dAqk + (i_i * BC + o_i)[:, None] + o_j[None, :] * (HV*BT)
             p_dAkk = dAkk + (i_i * BC + o_i)[:, None] + o_j[None, :] * (HV*BT)
             # [BC]
-            b_b = tl.load(p_b, mask=m_j, other=0.0)
+            # keep k * beta in FP32 before applying the decay factor
+            b_b = tl.load(p_b, mask=m_j, other=0.0).to(tl.float32)
             # [BC, BK]
             b_q = tl.load(p_q, mask=m_jk, other=0.0)
             b_kb = tl.load(p_k, mask=m_jk, other=0.0) * b_b[:, None]
@@ -605,8 +613,8 @@ def chunk_kda_bwd_kernel_intra(
             b_kbg = b_kb * tl.where(m_j[:, None], b_gkn, 0)
             # [BC, BK]
             # (SY 09/17) important to not use bf16 here to have a good precision.
-            b_dkt = tl.dot(b_dAqk, b_qg, b_dkt)
-            b_dkt = tl.dot(b_dAkk, b_kbg, b_dkt)
+            b_dkt = tl.dot(b_dAqk, b_qg, b_dkt, input_precision=DOT_INPUT_PRECISION)
+            b_dkt = tl.dot(b_dAkk, b_kbg, b_dkt, input_precision=DOT_INPUT_PRECISION)
         b_dkt *= exp2(b_gn - b_g)
     o_dA = i_ti * HV*BT + i_i * BC + o_i
     p_qj = q + i_ti * H*K + o_k
@@ -623,7 +631,7 @@ def chunk_kda_bwd_kernel_intra(
         p_q = q + o_c[:, None] * (H*K) + o_k[None, :]
         b_q = tl.load(p_q, mask=m_ck, other=0.0)
         p_b = beta + o_c * HV
-        b_b = tl.load(p_b, mask=m_c, other=0.0)
+        b_b = tl.load(p_b, mask=m_c, other=0.0).to(tl.float32)
 
         p_dAqk = dAqk + (i_i * BC + o_i)[:, None] + o_c[None, :] * (HV*BT)
         p_dAkk = dAkk + (i_i * BC + o_i)[:, None] + o_c[None, :] * (HV*BT)
@@ -643,8 +651,8 @@ def chunk_kda_bwd_kernel_intra(
         b_q_exp = b_q * exp_b_g_diag_kk
         b_kb_exp = b_k * b_b[:, None] * exp_b_g_diag_kk
 
-        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
-        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
+        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=DOT_INPUT_PRECISION) * exp_neg_b_g_diag_kk
+        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=DOT_INPUT_PRECISION) * exp_neg_b_g_diag_kk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             # [BC,]
@@ -652,7 +660,7 @@ def chunk_kda_bwd_kernel_intra(
             b_dAkk = tl.load(dAkk + o_dA + j * HV*BT)
             # [BK,]
             b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
-            b_kbj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32) * tl.load(p_bj)
+            b_kbj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32) * tl.load(p_bj).to(tl.float32)
             b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
             m_i = o_i[:, None] <= j
@@ -936,6 +944,7 @@ def chunk_kda_bwd_intra(
     BC = min(16, BT)
     BK = min(32, triton.next_power_of_2(K))
 
+    dot_precision = intra_dot_precision(IS_NVIDIA and IS_TF32_SUPPORTED)
     config = launch_config('FLA_KDA_BWD_INTRA_TILE', (16, 32, 64), (1, 2, 4, 8))
     config = config if IS_NVIDIA and not use_graph else None
     kernel = chunk_kda_bwd_kernel_intra
@@ -961,7 +970,10 @@ def chunk_kda_bwd_intra(
         dk2 = torch.empty_like(dk)
         db2 = beta.new_empty(NK, *beta.shape, dtype=torch.float)
         dg2 = torch.empty_like(dg, dtype=torch.float)
-    grid = (NK * NC, NT, B * HV)
+    # Visit heads of a time tile together to reuse adjacent Q/K/gate cache lines.
+    # Keep CUDA-graph and non-NVIDIA paths on their existing launch ordering.
+    head_first = IS_NVIDIA and not use_graph and os.getenv('FLA_KDA_BWD_INTRA_HEAD_FIRST') == '1'
+    grid = (NK * NC, B * HV, NT) if head_first else (NK * NC, NT, B * HV)
     kernel[grid](
         q=q,
         k=k,
@@ -990,6 +1002,8 @@ def chunk_kda_bwd_intra(
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
         USE_GRAPH=use_graph,
+        HEAD_FIRST=head_first,
+        DOT_INPUT_PRECISION=dot_precision,
         **launch,
     )
     dq = dq2

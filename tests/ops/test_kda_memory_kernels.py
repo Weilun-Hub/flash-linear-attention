@@ -26,7 +26,7 @@ def load_policy(relative):
 POLICY = load_policy('fla/ops/kda/backward_tuning.py')
 WY = load_policy('fla/ops/kda/backends/tilelang/tuning.py')
 FLAGS = ('FLA_CONV_BWD_RECOMPUTE_SILU',
-         'FLA_KDA_BWD_INTRA_TILE', 'FLA_KDA_RECOMPUTE_H_TILE')
+         'FLA_KDA_BWD_INTRA_TILE', 'FLA_KDA_RECOMPUTE_H_TILE', 'FLA_KDA_BWD_INTRA_HEAD_FIRST')
 GPU = pytest.mark.skipif(os.getenv('FLA_KDA_MEMORY_KERNEL_GPU_TEST') != '1', reason='explicit GPU opt-in')
 
 
@@ -98,7 +98,8 @@ def gpu(monkeypatch):
 @pytest.mark.parametrize('packed,safe,k,hv', [(False, False, 128, 2), (True, True, 128, 2),
                                            (True, False, 60, 4), (False, True, 100, 2)])
 @pytest.mark.parametrize('tile', ['32,1,3', '16,2,2', '32,4,2', '64,4,3'])
-def test_intra_gradients_and_storage(gpu, monkeypatch, packed, safe, k, hv, tile):
+@pytest.mark.parametrize('head_first', ['0', '1'])
+def test_intra_gradients_and_storage(gpu, monkeypatch, packed, safe, k, hv, tile, head_first):
     torch, device = gpu
     from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
 
@@ -114,6 +115,7 @@ def test_intra_gradients_and_storage(gpu, monkeypatch, packed, safe, k, hv, tile
     original = {key: x.clone() for key, x in kwargs.items() if isinstance(x, torch.Tensor)}
     expected = chunk_kda_bwd_intra(**kwargs)
     monkeypatch.setenv(FLAGS[1], tile)
+    monkeypatch.setenv(FLAGS[3], head_first)
     actual = chunk_kda_bwd_intra(**kwargs)
     assert_parity(expected, actual)
     for name, out in zip(('dq', 'dk', 'dg'), (actual[0], actual[1], actual[3])):
@@ -193,7 +195,7 @@ def test_convolution_backward_and_fallback(gpu, monkeypatch, packed, width, stat
 @GPU
 @pytest.mark.parametrize('packed,safe,gva,k,v', [(False, False, False, 128, 128), (True, True, False, 128, 128),
                                                (True, False, True, 60, 96)])
-@pytest.mark.parametrize('experiment', ['intra', 'state', 'combined'])
+@pytest.mark.parametrize('experiment', ['intra', 'state', 'combined', 'head_first'])
 def test_full_kda_forward_backward(gpu, monkeypatch, packed, safe, gva, k, v, experiment):
     torch, device = gpu
     from fla.ops.kda import chunk_kda
@@ -219,6 +221,8 @@ def test_full_kda_forward_backward(gpu, monkeypatch, packed, safe, gva, k, v, ex
         monkeypatch.setenv(FLAGS[1], '32,4,2')
     if experiment in ('state', 'combined'):
         monkeypatch.setenv(FLAGS[2], '16,2,2')
+    if experiment == 'head_first':
+        monkeypatch.setenv(FLAGS[3], '1')
     before = [z.detach().clone() for z in inputs]
     actual = run()
     assert_parity(expected, actual)
@@ -255,13 +259,14 @@ def test_intra_outputs_remain_separate(monkeypatch, mode):
                 kwargs['db'].zero_()
             return launch
 
-    namespace = dict(torch=torch, triton=SimpleNamespace(cdiv=lambda a, b: (a+b-1)//b,
+    namespace = dict(torch=torch, os=os, triton=SimpleNamespace(cdiv=lambda a, b: (a+b-1)//b,
                      next_power_of_2=lambda x: 1 << (x-1).bit_length()),
                      IS_NVIDIA=True, IS_GATHER_SUPPORTED=False, chunk_kda_bwd_kernel_intra=Kernel(False),
                      fixed_kernel=lambda kernel: Kernel(True), launch_config=POLICY.launch_config,
                      get_static_buffer=lambda name, shape, dtype, device: torch.zeros(shape, dtype=dtype, device=device))
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'), namespace)
     monkeypatch.setenv(FLAGS[1], '64,4,2')
+    monkeypatch.setenv(FLAGS[3], '1')
     def full():
         return torch.zeros(1, 64, 2, 128)
     kwargs = dict(q=full(), k=full(), g=full(), beta=torch.zeros(1, 64, 2),
@@ -273,5 +278,6 @@ def test_intra_outputs_remain_separate(monkeypatch, mode):
     fixed, launched = calls[0]
     assert fixed == (mode == 'fixed')
     assert launched['BK'] == (64 if mode == 'fixed' else 32)
+    assert launched['HEAD_FIRST'] == (mode == 'fixed')
     for name, out in zip(('dq', 'dk', 'dg'), (outputs[0], outputs[1], outputs[3])):
         assert out.data_ptr() != kwargs[name].data_ptr()

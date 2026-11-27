@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 
 from fla.ops.common.chunk_delta_h import (
-    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
+    _state_backward_launch,
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
 from fla.ops.cp.chunk_delta_h import pre_process_bwd_kernel_merged, pre_process_fwd_kernel_merged
@@ -208,7 +208,8 @@ def _raw_chunk_gated_delta_rule_bwd_dhu(
     def grid(meta):
         return (triton.cdiv(V, meta['BV']) * N * HV, )
 
-    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
+    kernel, launch_kwargs = _state_backward_launch(g, gk, dh0, dht, cu_seqlens)
+    kernel[grid](
         q=q,
         k=k,
         w=w,
@@ -231,6 +232,7 @@ def _raw_chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        **launch_kwargs,
     )
     return dh, dh0, dv2
 

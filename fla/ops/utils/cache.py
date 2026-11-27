@@ -342,9 +342,10 @@ class CachedAutotuner(Autotuner):
     try loading cached configuration first before falling back to autotune.
     """
 
-    def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, **kwargs):
+    def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, cached_config_filter=None, **kwargs):
         super().__init__(fn, arg_names, configs, key, reset_to_zero, restore_value, **kwargs)
         self.kernel_name = fn.fn.__name__ if hasattr(fn, 'fn') else fn.__name__
+        self.cached_config_filter = cached_config_filter
 
         # None-safe pre/post hooks: Triton's defaults crash when a restore_value / reset_to_zero arg
         # is None (idiomatic for optional pointers gated by a tl.constexpr flag).
@@ -393,6 +394,10 @@ class CachedAutotuner(Autotuner):
             } if TRITON_ABOVE_3_5_1 else {}
             cfg = triton.Config(kw, num_warps=num_warps, num_stages=num_stages, **extra)
 
+            if self.cached_config_filter is not None and not self.cached_config_filter(cfg):
+                logger.warning("Ignoring unsafe cached config for kernel %s: %s", self.kernel_name, cfg)
+                self.cache.pop(key.autotune_key, None)
+                return
             self.cache[key.autotune_key] = cfg
         else:
             logger.debug(
@@ -404,7 +409,7 @@ class CachedAutotuner(Autotuner):
 
 def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=None, restore_value=None,
                        pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False,
-                       do_bench=None, cache_results=False):
+                       do_bench=None, cache_results=False, cached_config_filter=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function with FLA config support.
 
@@ -412,6 +417,8 @@ def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=N
     (default: fla/configs/{GPU}/, or FLA_CONFIG_DIR/ when overridden), keyed by kernel
     name from {kernel_name}.json. Lookup behaviour is controlled by FLA_CACHE_MODE.
     Falls back to normal Triton autotuning when no cached config is found.
+    An optional cached_config_filter rejects unsafe file-based configs before
+    they can bypass the kernel's autotune candidate restrictions.
     """
     # key can be None when we want to use cache only (no fallback autotune)
     if key is None:
@@ -423,6 +430,7 @@ def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=N
             kwargs = {"cache_results": cache_results}
 
         return CachedAutotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value,
+                               cached_config_filter=cached_config_filter,
                                pre_hook=pre_hook, post_hook=post_hook,
                                prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
                                use_cuda_graph=use_cuda_graph, do_bench=do_bench,

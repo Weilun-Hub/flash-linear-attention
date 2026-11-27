@@ -10,6 +10,19 @@
 import os
 
 
+def intra_dot_precision(tf32_supported: bool) -> str | None:
+    """Select scoped precision, or delegate to Triton for a legacy-behavior ablation."""
+    mode = os.getenv('FLA_KDA_BWD_INTRA_DOT_PRECISION', 'ieee') or 'ieee'
+    if mode == 'default':
+        # None matches tl.dot's omitted input_precision argument, including Triton's environment policy.
+        return None
+    if mode not in ('ieee', 'tf32x3'):
+        raise ValueError('FLA_KDA_BWD_INTRA_DOT_PRECISION must be ieee, tf32x3 or default')
+    if mode == 'tf32x3' and not tf32_supported:
+        raise ValueError('KDA intra-backward tf32x3 requires an NVIDIA GPU with TF32 support')
+    return mode
+
+
 def launch_config(name: str, blocks: tuple[int, ...], warps: tuple[int, ...]):
     raw = os.environ.get(name, '')
     if not raw:
@@ -79,3 +92,39 @@ def reconstruct_state(**kwargs):
         num_warps=warps, num_stages=stages,
     )
     return states, values, final
+
+
+def state_backward_config() -> tuple[int, bool] | None:
+    """Keep state-backward tuning separate from WY and intra dot precision."""
+    raw = os.getenv('FLA_KDA_BWD_DHU_BV', '')
+    order = os.getenv('FLA_KDA_BWD_DHU_HEAD_FIRST', '0')
+    if order not in ('0', '1'):
+        raise ValueError('FLA_KDA_BWD_DHU_HEAD_FIRST must be 0 or 1')
+    if not raw:
+        if order == '1':
+            raise ValueError('Set FLA_KDA_BWD_DHU_BV when enabling head-first state backward')
+        return None
+    try:
+        bv = int(raw)
+    except ValueError as exc:
+        raise ValueError('FLA_KDA_BWD_DHU_BV must be 16, 32 or 64') from exc
+    if bv not in (16, 32, 64):
+        raise ValueError('FLA_KDA_BWD_DHU_BV must be 16, 32 or 64')
+    return bv, order == '1'
+
+
+def state_backward(**kwargs):
+    """Scope launch tuning to KDA while preserving backend and intra-card dispatch."""
+    from fla.ops.common.chunk_delta_h import _KDA_DHU_LAUNCH_CONFIG, chunk_gated_delta_rule_bwd_dhu
+    from fla.utils import IS_NVIDIA_BLACKWELL
+
+    config = state_backward_config()
+    if config is None:
+        return chunk_gated_delta_rule_bwd_dhu(**kwargs)
+    if not IS_NVIDIA_BLACKWELL:
+        raise ValueError('KDA state-backward launch tuning currently requires NVIDIA Blackwell')
+    token = _KDA_DHU_LAUNCH_CONFIG.set(config)
+    try:
+        return chunk_gated_delta_rule_bwd_dhu(**kwargs)
+    finally:
+        _KDA_DHU_LAUNCH_CONFIG.reset(token)

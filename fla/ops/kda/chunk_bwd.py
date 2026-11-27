@@ -11,13 +11,12 @@ import triton.language as tl
 
 from fla.ops.backends import dispatch
 from fla.ops.common.chunk_delta_h import (
-    chunk_gated_delta_rule_bwd_dhu,
     chunk_gated_delta_rule_fwd_h,
     prepare_chunk_gated_delta_rule_bwd_dhu_affine,
 )
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu_pre_process, expand_h0
-from fla.ops.kda.backward_tuning import reconstruct_state
+from fla.ops.kda.backward_tuning import reconstruct_state, state_backward
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
 from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
@@ -632,7 +631,7 @@ def chunk_kda_bwd(
     intra_summary_kwargs = (
         {"intra_affine_summary": intra_affine_summary} if intra_affine_summary is not None else {}
     )
-    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
+    dh, dh0, dv = state_backward(
         q=qg,
         k=kg,
         w=w,
